@@ -1,0 +1,6 @@
+[submodule "3rdparty/tvm"]
+	path = 3rdparty/tvm
+	url = https://github.com/apache/tvm.git
+[submodule "3rdparty/llvm-project"]
+	path = 3rdparty/llvm-project
+	url = https://github.com/llvm/llvm-project.git
