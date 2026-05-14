@@ -2,6 +2,15 @@
 
 setlocal
 
+set SKIP_LLVM=0
+
+:parse_args
+    if "%~1"=="" goto :done_args
+    if /I "%~1"=="/skip-llvm" set SKIP_LLVM=1
+    shift
+    goto :parse_args
+:done_args
+
 set target=ALL_BUILD
 REM set target=clean
 
@@ -11,11 +20,15 @@ set /a nproc=%NUMBER_OF_PROCESSORS% / 2
 if %nproc% LSS 1 set nproc=1
 
 pushd 3rdparty
+
+    if "%SKIP_LLVM%"=="1" goto :skip_llvm_build
+
     pushd llvm-project
         if not exist llvm\build (md llvm\build || goto :exit)
         pushd llvm\build || goto :exit
             cmake ^
                 -DLLVM_ENABLE_PROJECTS=clang ^
+                "-DLLVM_TARGETS_TO_BUILD=X86;ARM;AArch64" ^
                 -DLLVM_INCLUDE_TESTS=OFF ^
                 -DCMAKE_BUILD_TYPE=%build_type% .. || goto :exit
             cmake --build . --target %target% --parallel %nproc% --config %build_type% || goto :exit
@@ -25,16 +38,17 @@ pushd 3rdparty
             )
         popd
     popd
+
+:skip_llvm_build
     
     pushd tvm
         if not exist build (md build || goto :exit)
         pushd build
             copy /y ..\cmake\config.cmake .
             echo set(USE_EXAMPLE_NPU_CODEGEN ON) >> config.cmake
-            echo set(USE_EXAMPLE_NPU_RUNTIME ON) >> conifg.cmake
+            echo set(USE_EXAMPLE_NPU_RUNTIME ON) >> config.cmake
             echo set(USE_LLVM "llvm-config --ignore-libllvm --link-static") >> config.cmake
-            REM MSVC does not support this option.
-            echo set(HIDE_PRIVATE_SYMBOLS OFF) >> config.cmake
+            echo set(HIDE_PRIVATE_SYMBOLS ON) >> config.cmake
             echo set(CMAKE_BUILD_TYPE %build_type%) >> config.cmake
             REM For some reason even though both LLVM are compiled with Debug
             REM this flag is needed to compile...
