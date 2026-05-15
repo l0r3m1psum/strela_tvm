@@ -43,3 +43,35 @@ with tvm.transform.PassContext(opt_level=3):
 
 vm = relax.VirtualMachine(build, tvm.cpu())
 result = vm["main"](tvm.runtime.tensor(x_np, tvm.cpu()), tvm.runtime.tensor(w_np, tvm.cpu()))
+
+################################################################################
+
+import tvm.relax.backend.contrib.strela
+
+patterns = relax.backend.pattern_registry.get_patterns_with_prefix("strela")
+print("Registered patterns:", [p.name for p in patterns])
+
+mod = MatmulReLU
+mod.show()
+mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
+mod.show()
+mod = relax.transform.MergeCompositeFunctions()(mod)
+print("After partitioning:")
+mod.show()
+mod = relax.transform.RunCodegen()(mod)
+print("After codegen:")
+mod.show()
+
+with tvm.transform.PassContext(opt_level=3):
+    build = relax.build(mod, target)
+
+vm = relax.VirtualMachine(build, tvm.cpu())
+
+print("relax.VirtualMachine created")
+
+numpy.random.seed(0)
+x_np = numpy.random.randn(2, 4).astype("float32")
+w_np = numpy.random.randn(4, 8).astype("float32")
+
+result = vm["main"](tvm.runtime.tensor(x_np, tvm.cpu()), tvm.runtime.tensor(w_np, tvm.cpu()))
+print(result)
