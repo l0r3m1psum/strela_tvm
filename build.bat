@@ -48,7 +48,8 @@ pushd 3rdparty
             echo set(USE_EXAMPLE_NPU_CODEGEN ON) >> config.cmake
             echo set(USE_EXAMPLE_NPU_RUNTIME ON) >> config.cmake
             echo set(USE_STRELA_CODEGEN ON) >> config.cmake
-            echo set(USE_STRELA_RUNTIME ON) >> config.cmake
+            REM This works only on Linux
+            REM echo set(USE_STRELA_RUNTIME ON) >> config.cmake
             echo set(USE_LLVM "llvm-config --ignore-libllvm --link-static") >> config.cmake
             echo set(HIDE_PRIVATE_SYMBOLS ON) >> config.cmake
             echo set(CMAKE_BUILD_TYPE %build_type%) >> config.cmake
