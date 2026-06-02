@@ -4,3 +4,6 @@
 [submodule "3rdparty/tvm"]
 	path = 3rdparty/tvm
 	url = https://github.com/l0r3m1psum/tvm
+[submodule "3rdparty/tiny"]
+	path = 3rdparty/tiny
+	url = https://github.com/mlcommons/tiny.git

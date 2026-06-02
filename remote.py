@@ -56,21 +56,21 @@ def try_simple_computation_on_remote():
 import tvm.relax.backend.contrib.strela  # registers patterns
 patterns = relax.backend.pattern_registry.get_patterns_with_prefix("strela")
 
-@lambda _: _()
-def try_simple_kernel_on_remote_strela():
-    @I.ir_module
-    class MatmulReLU:
-        @R.function
-        def main(
-            x: R.Tensor((2, 4), "int32"),
-            w: R.Tensor((4, 8), "int32"),
-        ) -> R.Tensor((2, 8), "int32"):
-            with R.dataflow():
-                y = R.matmul(x, w)
-                z = R.nn.relu(y)
-                R.output(z)
-            return z
+@I.ir_module
+class MatmulReLU:
+    @R.function
+    def main(
+        x: R.Tensor((2, 4), "int32"),
+        w: R.Tensor((4, 8), "int32"),
+    ) -> R.Tensor((2, 8), "int32"):
+        with R.dataflow():
+            y = R.matmul(x, w)
+            z = R.nn.relu(y)
+            R.output(z)
+        return z
 
+# @lambda _: _()
+def try_simple_kernel_on_remote_strela():
     mod = MatmulReLU
     mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
     mod = relax.transform.MergeCompositeFunctions()(mod)
@@ -118,3 +118,30 @@ def try_simple_device_api_on_remote_strela():
 
     func(a, b)
     numpy.testing.assert_equal(b.numpy(), a.numpy() + 1)
+
+@lambda _: _()
+def try_compile_with_zero_copy():
+    mod = MatmulReLU
+    mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
+    mod = relax.transform.MergeCompositeFunctions()(mod)
+    mod = relax.transform.RunCodegen()(mod)
+    mod.show()
+
+    ex = tvm.compile(mod, target=target_ext_dev)
+    temp = utils.tempdir()
+    path = temp.relpath("lib_strela_.tar")
+    ex.export_library(path)
+
+    remote.upload(path)
+    dev = remote.ext_dev()
+
+    ex = remote.load_module("lib_strela_.tar")
+    vm = relax.VirtualMachine(ex, dev)
+
+    x = tvm.runtime.tensor(numpy.ones((2, 4), dtype="int32"), dev)
+    xn = tvm.runtime.tensor(-numpy.ones((2, 4), dtype="int32"), dev)
+    w = tvm.runtime.tensor(numpy.ones((4, 8), dtype="int32"), dev)
+    z = vm["main"](x, w)
+    print(z)
+    z = vm["main"](xn, w)
+    print(z)
