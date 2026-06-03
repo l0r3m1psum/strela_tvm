@@ -41,6 +41,8 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int]:
             # Otherwise the tensor could be something like the shape argument of
             # reshape.
             if quantization.ScaleLength() > 0:
+                if not tensor_type_name.startswith("INT"):
+                    raise ValueError("A UINT is needed...")
                 int_quant_tensor_count += 1
 
     assert float_tensor_count >= internal_float_tensor_count
