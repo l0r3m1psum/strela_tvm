@@ -1,6 +1,6 @@
 import os
 import pprint
-from typing import Tuple
+from typing import Tuple, Set
 
 import tflite
 import tvm.relax.frontend.tflite
@@ -10,7 +10,7 @@ def is_tensor_constant(model: tflite.Model, tensor: tflite.Tensor) -> bool:
     buffer = model.Buffers(buffer_index)
     return buffer is not None and buffer.DataLength() > 0
 
-def analyze(model: tflite.Model) -> Tuple[int, int, int]:
+def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str]]:
     subgraph = model.Subgraphs(0)
 
     type_dict = {v: k for k, v in tflite.TensorType.__dict__.items() if not k.startswith('__')}
@@ -50,57 +50,89 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int]:
 
     mixed_ops_count = 0
     weight_only_mixed_ops_count = 0
+    ops_found = set()
 
-    if not is_integer_only:
-        opcode_dict = {v: k for k, v in tflite.BuiltinOperator.__dict__.items() if not k.startswith('__')}
-        operator_codes = [model.OperatorCodes(i).BuiltinCode() for i in range(model.OperatorCodesLength())]
+    opcode_dict = {v: k for k, v in tflite.BuiltinOperator.__dict__.items() if not k.startswith('__')}
+    operator_codes = [model.OperatorCodes(i).BuiltinCode() for i in range(model.OperatorCodesLength())]
+    activation_dict = {
+        v: k for k, v in tflite.ActivationFunctionType.__dict__.items()
+        if not k.startswith('__')
+    }
+    builtin_options_dict = {
+        v: k for k, v in tflite.BuiltinOptions.__dict__.items()
+        if not k.startswith('__')
+    }
 
-        for i in range(subgraph.OperatorsLength()):
-            op = subgraph.Operators(i)
+    for i in range(subgraph.OperatorsLength()):
+        op = subgraph.Operators(i)
 
-            opcode_index = op.OpcodeIndex()
-            op_code_enum = operator_codes[opcode_index]
-            op_name = opcode_dict[op_code_enum]
+        opcode_index = op.OpcodeIndex()
+        op_code_enum = operator_codes[opcode_index]
+        op_name = opcode_dict[op_code_enum]
 
-            has_float = False
-            has_int_quant = False
-            has_quantized_activation = False
-            input_types_found = []
+        ops_found.add(op_name)
 
-            for j in range(op.InputsLength()):
-                tensor_idx = op.Inputs(j)
+        opt = op.BuiltinOptions()
+        opt_type = op.BuiltinOptionsType()
 
-                is_optional = tensor_idx == -1
-                if is_optional:
-                    continue
+        if opt is not None and opt_type != tflite.BuiltinOptions.NONE:
+            class_name = builtin_options_dict.get(opt_type)
+            OptionClass = getattr(tflite, class_name, None) if class_name else N
 
-                tensor = subgraph.Tensors(tensor_idx)
-                tensor_type_name = type_dict[tensor.Type()]
-                input_types_found.append(tensor_type_name)
+            if OptionClass is not None:
+                options = OptionClass()
+                options.Init(opt.Bytes, opt.Pos)
 
-                if tensor_type_name in float_types:
-                    has_float = True
-                elif tensor_type_name in int_types:
-                    quantization = tensor.Quantization()
-                    if quantization.ScaleLength() > 0:
-                        has_int_quant = True
+                if hasattr(options, 'FusedActivationFunction'):
+                    fused_activation_enum = options.FusedActivationFunction()
 
-                        if not is_tensor_constant(model, tensor):
-                            has_quantized_activation = True
+                    if fused_activation_enum != tflite.ActivationFunctionType.NONE:
+                        fused_op_name = f"FUSED_{activation_dict[fused_activation_enum]}"
+                        ops_found.add(fused_op_name)
 
-            if has_float and has_int_quant:
-                mixed_ops_count += 1
+        if is_integer_only:
+            continue
 
-                if not has_quantized_activation:
-                    weight_only_mixed_ops_count += 1
+        has_float = False
+        has_int_quant = False
+        has_quantized_activation = False
+        input_types_found = []
+
+        for j in range(op.InputsLength()):
+            tensor_idx = op.Inputs(j)
+
+            is_optional = tensor_idx == -1
+            if is_optional:
+                continue
+
+            tensor = subgraph.Tensors(tensor_idx)
+            tensor_type_name = type_dict[tensor.Type()]
+            input_types_found.append(tensor_type_name)
+
+            if tensor_type_name in float_types:
+                has_float = True
+            elif tensor_type_name in int_types:
+                quantization = tensor.Quantization()
+                if quantization.ScaleLength() > 0:
+                    has_int_quant = True
+
+                    if not is_tensor_constant(model, tensor):
+                        has_quantized_activation = True
+
+        if has_float and has_int_quant:
+            mixed_ops_count += 1
+
+            if not has_quantized_activation:
+                weight_only_mixed_ops_count += 1
 
     if mixed_ops_count != weight_only_mixed_ops_count: raise ValueError
 
-    return float_tensor_count, int_quant_tensor_count, mixed_ops_count
+    return float_tensor_count, int_quant_tensor_count, mixed_ops_count, ops_found
 
 float_networks = []
 int_quant_networks = []
 mixed_networks = []
+all_ops = set()
 
 for root, dirs, files in os.walk("3rdparty/tiny"):
     for file in files:
@@ -109,10 +141,12 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
             with open(model_path, "rb") as f:
                 tflite_model_buf = f.read()
             tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
-            float_tensor_count, quant_tensors_count, mixed_ops_count = analyze(tflite_model)
+            float_tensor_count, quant_tensors_count, mixed_ops_count, ops = analyze(tflite_model)
             print(file,
                 "float_tensor_count = %d quant_tensors_count = %d mixed_ops_count = %d"
                 % (float_tensor_count, quant_tensors_count, mixed_ops_count))
+            print(ops)
+            all_ops.update(ops)
             if quant_tensors_count == 0:
                 mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
                 # mod.show()
@@ -122,6 +156,8 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
             else:
                 mixed_networks.append(model_path)
 
+
+print("all operations\n\t" + str(all_ops))
 print("float_networks")
 for path in float_networks: print("\t" + os.path.normpath(path))
 print("int_quant_networks")
