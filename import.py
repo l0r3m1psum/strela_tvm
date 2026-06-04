@@ -123,8 +123,8 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
                 mixed_networks.append(model_path)
 
 print("float_networks")
-pprint.pprint(float_networks)
+for path in float_networks: print("\t" + os.path.normpath(path))
 print("int_quant_networks")
-pprint.pprint(int_quant_networks)
+for path in int_quant_networks: print("\t" + os.path.normpath(path))
 print("mixed_networks")
-pprint.pprint(mixed_networks)
+for path in mixed_networks: print("\t" + os.path.normpath(path))
