@@ -77,7 +77,7 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str]]:
 
         if opt is not None and opt_type != tflite.BuiltinOptions.NONE:
             class_name = builtin_options_dict.get(opt_type)
-            OptionClass = getattr(tflite, class_name, None) if class_name else N
+            OptionClass = getattr(tflite, class_name, None) if class_name else None
 
             if OptionClass is not None:
                 options = OptionClass()
