@@ -12,6 +12,17 @@ def _make_sinfo(shape, dtype, ndim):
     vdevice = None
     return relax.TensorStructInfo(shape, dtype, vdevice, ndim if shape is None else -1)
 
+def _make_qparam_vars(name_prefix, shape, zp_dtype, fallback_ndim=-1):
+    """Helper to generate scale and zero-point vars with specific quantization shapes."""
+    if shape is None:
+        scale_sinfo = relax.TensorStructInfo(None, "float32", ndim=fallback_ndim)
+        zp_sinfo = relax.TensorStructInfo(None, zp_dtype, ndim=fallback_ndim)
+    else:
+        scale_sinfo = relax.TensorStructInfo(shape, "float32")
+        zp_sinfo = relax.TensorStructInfo(shape, zp_dtype)
+
+    return relax.Var(f"{name_prefix}_scale", scale_sinfo), relax.Var(f"{name_prefix}_zp", zp_sinfo)
+
 def _check_tensor_sinfo(sinfo, expected_dtype, expected_shape, expected_ndim):
     """Asserts dtype, and either structural shape equality or correct ndim."""
     assert isinstance(sinfo, relax.TensorStructInfo)
@@ -23,37 +34,39 @@ def _check_tensor_sinfo(sinfo, expected_dtype, expected_shape, expected_ndim):
         assert sinfo.shape is not None
         assert_structural_equal(sinfo.shape, relax.ShapeExpr(expected_shape))
 
+
+# --- TESTS ---
+
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 @pytest.mark.parametrize(
-    "a_shape, b_shape, ndim, expected_shape, expected_ndim",
+    "a_shape, a_q_shape, b_shape, b_q_shape, out_q_shape, ndim, expected_shape, expected_ndim",
     [
-        # Concrete Shapes
-        ((1, 3, 224, 224), (1, 3, 224, 224), 4, (1, 3, 224, 224), 4),
-        # Concrete Broadcast
-        ((1, 3, 224, 224), (1, 3, 1, 1), 4, (1, 3, 224, 224), 4),
-        # Symbolic Shapes
-        ((n, c, h, w), (n, c, h, w), 4, (n, c, h, w), 4),
+        # Concrete (Per-tensor)
+        ((1, 3, 224, 224), (), (1, 3, 224, 224), (), (), 4, (1, 3, 224, 224), 4),
+        # Concrete (Per-axis on channels, dim=1)
+        ((1, 3, 224, 224), (1, 3, 1, 1), (1, 3, 224, 224), (1, 3, 1, 1), (1, 3, 1, 1), 4, (1, 3, 224, 224), 4),
+        # Concrete (Per-block on spatial dims, e.g., 16x16 blocks -> 224/16 = 14)
+        ((1, 3, 224, 224), (1, 3, 14, 14), (1, 3, 224, 224), (1, 3, 14, 14), (), 4, (1, 3, 224, 224), 4),
         # Symbolic Broadcast
-        ((n, c, h, w), (1, c, 1, 1), 4, (n, c, h, w), 4),
-        # Omitted Shape (Known Rank)
-        (None, None, 4, None, 4),
+        ((n, c, h, w), (), (1, c, 1, 1), (), (), 4, (n, c, h, w), 4),
+        # Symbolic (Per-axis on channels)
+        ((n, c, h, w), (1, c, 1, 1), (n, c, h, w), (1, c, 1, 1), (), 4, (n, c, h, w), 4),
+        # Omitted Shape (Known Rank, Unknown Q-Rank)
+        (None, None, None, None, None, 4, None, 4),
         # Omitted Shape (Unknown Rank)
-        (None, None, -1, None, -1),
+        (None, None, None, None, None, -1, None, -1),
     ]
 )
-def test_qnn_add_inference(dtype, a_shape, b_shape, ndim, expected_shape, expected_ndim):
+def test_qnn_add_inference(dtype, a_shape, a_q_shape, b_shape, b_q_shape, out_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
     a = relax.Var("a", _make_sinfo(a_shape, dtype, ndim))
-    a_scale = relax.Var("a_scale", relax.TensorStructInfo((), "float32"))
-    a_zp = relax.Var("a_zp", relax.TensorStructInfo((), dtype))
+    a_scale, a_zp = _make_qparam_vars("a", a_q_shape, dtype)
 
     b = relax.Var("b", _make_sinfo(b_shape, dtype, ndim))
-    b_scale = relax.Var("b_scale", relax.TensorStructInfo((), "float32"))
-    b_zp = relax.Var("b_zp", relax.TensorStructInfo((), dtype))
+    b_scale, b_zp = _make_qparam_vars("b", b_q_shape, dtype)
 
-    c_scale = relax.Var("c_scale", relax.TensorStructInfo((), "float32"))
-    c_zp = relax.Var("c_zp", relax.TensorStructInfo((), dtype))
+    c_scale, c_zp = _make_qparam_vars("c", out_q_shape, dtype)
 
     with bb.function("main", params=[a, a_scale, a_zp, b, b_scale, b_zp, c_scale, c_zp]):
         out = relax.op.qnn.add(a, a_scale, a_zp, b, b_scale, b_zp, c_scale, c_zp)
@@ -62,46 +75,43 @@ def test_qnn_add_inference(dtype, a_shape, b_shape, ndim, expected_shape, expect
     func = bb.get()["main"]
     _check_tensor_sinfo(func.ret_struct_info, dtype, expected_shape, expected_ndim)
 
+
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 @pytest.mark.parametrize(
-    "x_shape, w_shape, ndim, expected_shape, expected_ndim",
+    "x_shape, w_shape, w_q_shape, ndim, expected_shape, expected_ndim",
     [
-        # Concrete
-        ((1, 64, 56, 56), (128, 64, 3, 3), 4, (1, 128, 28, 28), 4),
+        # Per-tensor
+        ((1, 64, 56, 56), (128, 64, 3, 3), (), 4, (1, 128, 28, 28), 4),
+        # Per-axis on weights (out_channels = 128)
+        ((1, 64, 56, 56), (128, 64, 3, 3), (128, 1, 1, 1), 4, (1, 128, 28, 28), 4),
+        # Per-block on weights (block size 32 on in_channels -> 64/32 = 2)
+        ((1, 64, 56, 56), (128, 64, 3, 3), (128, 2, 1, 1), 4, (1, 128, 28, 28), 4),
         # Symbolic: out_dim = (in_dim + pad - kernel) // stride + 1
-        # For H/W: (dim + 2 - 3) // 2 + 1  ->  (dim - 1) // 2 + 1
-        ((n, 64, h, w), (128, 64, 3, 3), 4, (n, 128, (h - 1) // 2 + 1, (w - 1) // 2 + 1), 4),
-        # Omitted (Known Rank)
-        (None, None, 4, None, 4),
-        # Omitted (Unknown Rank)
-        (None, None, -1, None, -1),
+        ((n, 64, h, w), (128, 64, 3, 3), (), 4, (n, 128, (h - 1) // 2 + 1, (w - 1) // 2 + 1), 4),
+        # Omitted Shapes
+        (None, None, None, 4, None, 4),
+        (None, None, None, -1, None, -1),
     ]
 )
-def test_qnn_conv2d_inference(use_bias, dtype, x_shape, w_shape, ndim, expected_shape, expected_ndim):
+def test_qnn_conv2d_inference(use_bias, dtype, x_shape, w_shape, w_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
     x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
-    x_scale = relax.Var("x_scale", relax.TensorStructInfo((), "float32"))
-    x_zp = relax.Var("x_zp", relax.TensorStructInfo((), dtype))
+    x_scale, x_zp = _make_qparam_vars("x", (), dtype)  # Acts per-tensor
 
     w = relax.Var("w", _make_sinfo(w_shape, dtype, ndim))
-    w_scale = relax.Var("w_scale", relax.TensorStructInfo((), "float32"))
-    w_zp = relax.Var("w_zp", relax.TensorStructInfo((), dtype))
+    w_scale, w_zp = _make_qparam_vars("w", w_q_shape, dtype) # Parameterized for axis/block
 
-    y_scale = relax.Var("y_scale", relax.TensorStructInfo((), "float32"))
-    y_zp = relax.Var("y_zp", relax.TensorStructInfo((), dtype))
+    y_scale, y_zp = _make_qparam_vars("y", (), dtype)
 
-    # Initialize optional bias
     if use_bias:
         if expected_shape is not None:
-            # Broadcastable bias shape: (out_channels, 1, 1)
             b_shape = (expected_shape[1], 1, 1)
             b_ndim = 3
         else:
             b_shape = None
             b_ndim = expected_ndim
-        # Bias in QNN operations is typically int32 to hold the accumulated sum
         B = relax.Var("B", _make_sinfo(b_shape, "int32", b_ndim))
     else:
         B = None
@@ -112,11 +122,8 @@ def test_qnn_conv2d_inference(use_bias, dtype, x_shape, w_shape, ndim, expected_
 
     with bb.function("main", params=params):
         out = relax.op.qnn.conv2d(
-            x, x_scale, x_zp,
-            w, w_scale, w_zp,
-            y_scale, y_zp,
-            B=B,
-            strides=(2, 2), padding=(1, 1, 1, 1)
+            x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp,
+            B=B, strides=(2, 2), padding=(1, 1, 1, 1)
         )
         bb.emit_func_output(out)
 
@@ -127,37 +134,38 @@ def test_qnn_conv2d_inference(use_bias, dtype, x_shape, w_shape, ndim, expected_
 @pytest.mark.parametrize("use_bias", [False, True])
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 @pytest.mark.parametrize(
-    "x_shape, w_shape, ndim, expected_shape, expected_ndim",
+    "x_shape, x_q_shape, w_shape, w_q_shape, ndim, expected_shape, expected_ndim",
     [
-        # Concrete
-        ((32, 128), (128, 256), 2, (32, 256), 2),
+        # Per-tensor
+        ((32, 128), (), (128, 256), (), 2, (32, 256), 2),
+        # Per-axis on weights (out_features = 256)
+        ((32, 128), (), (128, 256), (256,), 2, (32, 256), 2),
+        # Per-block on weights (block size 32 over K dimension -> 128/32 = 4)
+        ((32, 128), (), (128, 256), (4, 256), 2, (32, 256), 2),
+        # Per-block on activations (block size 32 over K dim)
+        ((32, 128), (32, 4), (128, 256), (4, 256), 2, (32, 256), 2),
         # Symbolic
-        ((n, 128), (128, 256), 2, (n, 256), 2),
-        # Omitted (Known Rank)
-        (None, None, 2, None, 2),
-        # Omitted (Unknown Rank)
-        (None, None, -1, None, -1),
+        ((n, 128), (), (128, 256), (), 2, (n, 256), 2),
+        # Omitted
+        (None, None, None, None, 2, None, 2),
+        (None, None, None, None, -1, None, -1),
     ]
 )
-def test_qnn_linear_inference(use_bias, dtype, x_shape, w_shape, ndim, expected_shape, expected_ndim):
+def test_qnn_linear_inference(use_bias, dtype, x_shape, x_q_shape, w_shape, w_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
     alpha = relax.Var("alpha", relax.TensorStructInfo((), "float32"))
+
     x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
-    x_scale = relax.Var("x_scale", relax.TensorStructInfo((), "float32"))
-    x_zp = relax.Var("x_zp", relax.TensorStructInfo((), dtype))
+    x_scale, x_zp = _make_qparam_vars("x", x_q_shape, dtype)
 
     w = relax.Var("w", _make_sinfo(w_shape, dtype, ndim))
-    w_scale = relax.Var("w_scale", relax.TensorStructInfo((), "float32"))
-    w_zp = relax.Var("w_zp", relax.TensorStructInfo((), dtype))
+    w_scale, w_zp = _make_qparam_vars("w", w_q_shape, dtype)
 
-    y_scale = relax.Var("y_scale", relax.TensorStructInfo((), "float32"))
-    y_zp = relax.Var("y_zp", relax.TensorStructInfo((), dtype))
+    y_scale, y_zp = _make_qparam_vars("y", (), dtype)
 
-    # Initialize optional bias
     if use_bias:
         if expected_shape is not None:
-            # Broadcastable bias shape: (out_features,)
             b_shape = (expected_shape[1],)
             b_ndim = 1
         else:
@@ -173,41 +181,37 @@ def test_qnn_linear_inference(use_bias, dtype, x_shape, w_shape, ndim, expected_
 
     with bb.function("main", params=params):
         out = relax.op.qnn.linear(
-            alpha, x, x_scale, x_zp,
-            w, w_scale, w_zp,
-            y_scale, y_zp,
-            B=B
+            alpha, x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, B=B
         )
         bb.emit_func_output(out)
 
     func = bb.get()["main"]
     _check_tensor_sinfo(func.ret_struct_info, dtype, expected_shape, expected_ndim)
 
+
 @pytest.mark.parametrize("out_dtype", ["int8", "uint8"])
 @pytest.mark.parametrize(
-    "x_shape, x_ndim, qaxis, exp_q_shape, exp_q_ndim, exp_p_shape, exp_p_ndim",
+    "x_shape, x_ndim, axis, exp_q_shape, exp_q_ndim, exp_p_shape, exp_p_ndim",
     [
         # Concrete per-axis
         ((10, 20, 30), 3, 1, (10, 20, 30), 3, (20,), 1),
         # Symbolic per-axis
         ((n, c, h), 3, 1, (n, c, h), 3, (c,), 1),
-        # Omitted known rank per-axis (scale should fallback to 1D)
+        # Omitted known rank per-axis
         (None, 3, 1, None, 3, None, 1),
-        # Omitted unknown rank per-axis (qaxis fallback)
+        # Omitted unknown rank per-axis
         (None, -1, 1, None, -1, None, 1),
         # Concrete per-tensor
         ((10, 20, 30), 3, None, (10, 20, 30), 3, (), 0),
     ]
 )
-def test_qnn_dynamic_quantize_inference(
-    out_dtype, x_shape, x_ndim, qaxis, exp_q_shape, exp_q_ndim, exp_p_shape, exp_p_ndim
-):
+def test_qnn_dynamic_quantize_inference(out_dtype, x_shape, x_ndim, axis, exp_q_shape, exp_q_ndim, exp_p_shape, exp_p_ndim):
     bb = relax.BlockBuilder()
 
     x = relax.Var("x", _make_sinfo(x_shape, "float32", x_ndim))
 
     with bb.function("main", params=[x]):
-        out = relax.op.qnn.dynamic_quantize(x, qaxis=qaxis, out_dtype=out_dtype)
+        out = relax.op.qnn.dynamic_quantize(x, axis=axis, out_dtype=out_dtype)
         bb.emit_func_output(out)
 
     func = bb.get()["main"]
@@ -222,77 +226,70 @@ def test_qnn_dynamic_quantize_inference(
     _check_tensor_sinfo(scale_sinfo, "float32", exp_p_shape, exp_p_ndim)
     _check_tensor_sinfo(zp_sinfo, out_dtype, exp_p_shape, exp_p_ndim)
 
+
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 @pytest.mark.parametrize(
-    "x_shape, ndim, expected_shape, expected_ndim",
+    "x_shape, x_q_shape, ndim, expected_shape, expected_ndim",
     [
-        # Concrete: (N, C, H, W) with pool_size=(3, 3), strides=(2, 2), padding=(1, 1, 1, 1)
-        # H_out = (H_in + 2*pad - pool_size) // stride + 1 = (56 + 2 - 3) // 2 + 1 = 28
-        ((1, 64, 56, 56), 4, (1, 64, 28, 28), 4),
+        # Concrete (Per-tensor)
+        ((1, 64, 56, 56), (), 4, (1, 64, 28, 28), 4),
+        # Concrete (Per-axis on channels)
+        ((1, 64, 56, 56), (1, 64, 1, 1), 4, (1, 64, 28, 28), 4),
         # Symbolic
-        ((n, c, h, w), 4, (n, c, (h - 1) // 2 + 1, (w - 1) // 2 + 1), 4),
-        # Omitted (Known Rank)
-        (None, 4, None, 4),
-        # Omitted (Unknown Rank)
-        (None, -1, None, -1),
+        ((n, c, h, w), (), 4, (n, c, (h - 1) // 2 + 1, (w - 1) // 2 + 1), 4),
+        # Omitted
+        (None, None, 4, None, 4),
+        (None, None, -1, None, -1),
     ]
 )
-def test_qnn_avg_pool2d_inference(dtype, x_shape, ndim, expected_shape, expected_ndim):
+def test_qnn_avg_pool2d_inference(dtype, x_shape, x_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
     x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
-    x_scale = relax.Var("x_scale", relax.TensorStructInfo((), "float32"))
-    x_zp = relax.Var("x_zp", relax.TensorStructInfo((), dtype))
+    x_scale, x_zp = _make_qparam_vars("x", x_q_shape, dtype)
 
-    y_scale = relax.Var("y_scale", relax.TensorStructInfo((), "float32"))
-    y_zp = relax.Var("y_zp", relax.TensorStructInfo((), dtype))
+    y_scale, y_zp = _make_qparam_vars("y", (), dtype)
 
     with bb.function("main", params=[x, x_scale, x_zp, y_scale, y_zp]):
         out = relax.op.qnn.avg_pool2d(
-            x, x_scale, x_zp,
-            y_scale, y_zp,
+            x, x_scale, x_zp, y_scale, y_zp,
             pool_size=(3, 3), strides=(2, 2), padding=(1, 1, 1, 1)
         )
         bb.emit_func_output(out)
 
     func = bb.get()["main"]
-    # For avg_pool2d, output dtype is inherited from the input
     _check_tensor_sinfo(func.ret_struct_info, dtype, expected_shape, expected_ndim)
 
 
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 @pytest.mark.parametrize(
-    "x_shape, ndim, expected_shape, expected_ndim",
+    "x_shape, x_q_shape, ndim, expected_shape, expected_ndim",
     [
-        # Concrete 2D
-        ((32, 1000), 2, (32, 1000), 2),
-        # Concrete 4D
-        ((1, 3, 224, 224), 4, (1, 3, 224, 224), 4),
+        # Concrete 2D (Per-tensor)
+        ((32, 1000), (), 2, (32, 1000), 2),
+        # Concrete 2D (Per-axis)
+        ((32, 1000), (32, 1), 2, (32, 1000), 2),
+        # Concrete 4D (Per-tensor)
+        ((1, 3, 224, 224), (), 4, (1, 3, 224, 224), 4),
         # Symbolic
-        ((n, c), 2, (n, c), 2),
-        # Omitted (Known Rank)
-        (None, 2, None, 2),
-        # Omitted (Unknown Rank)
-        (None, -1, None, -1),
+        ((n, c), (), 2, (n, c), 2),
+        # Omitted
+        (None, None, 2, None, 2),
+        (None, None, -1, None, -1),
     ]
 )
-def test_qnn_softmax_inference(dtype, x_shape, ndim, expected_shape, expected_ndim):
+def test_qnn_softmax_inference(dtype, x_shape, x_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
     beta = relax.Var("beta", relax.TensorStructInfo((), "float32"))
-    x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
-    x_scale = relax.Var("x_scale", relax.TensorStructInfo((), "float32"))
-    x_zp = relax.Var("x_zp", relax.TensorStructInfo((), dtype))
 
-    y_scale = relax.Var("y_scale", relax.TensorStructInfo((), "float32"))
-    y_zp = relax.Var("y_zp", relax.TensorStructInfo((), dtype))
+    x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
+    x_scale, x_zp = _make_qparam_vars("x", x_q_shape, dtype)
+
+    y_scale, y_zp = _make_qparam_vars("y", (), dtype)
 
     with bb.function("main", params=[beta, x, x_scale, x_zp, y_scale, y_zp]):
-        out = relax.op.qnn.softmax(
-            beta, x, x_scale, x_zp,
-            y_scale, y_zp,
-            axis=-1
-        )
+        out = relax.op.qnn.softmax(beta, x, x_scale, x_zp, y_scale, y_zp, axis=-1)
         bb.emit_func_output(out)
 
     func = bb.get()["main"]
