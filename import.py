@@ -10,7 +10,7 @@ def is_tensor_constant(model: tflite.Model, tensor: tflite.Tensor) -> bool:
     buffer = model.Buffers(buffer_index)
     return buffer is not None and buffer.DataLength() > 0
 
-def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str]]:
+def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str], bool]:
     subgraph = model.Subgraphs(0)
 
     type_dict = {v: k for k, v in tflite.TensorType.__dict__.items() if not k.startswith('__')}
@@ -25,6 +25,7 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str]]:
     internal_float_tensor_count = 0
     int_quant_tensor_count = 0
     dtypes_found = set()
+    uses_per_axis_quantization = False
 
     for i in range(subgraph.TensorsLength()):
         tensor = subgraph.Tensors(i)
@@ -41,6 +42,8 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str]]:
             # Otherwise the tensor could be something like the shape argument of
             # reshape.
             if quantization.ScaleLength() > 0:
+                if quantization.ScaleLength() != 1:
+                    uses_per_axis_quantization = True
                 if not tensor_type_name.startswith("INT"):
                     raise ValueError("A UINT is needed...")
                 int_quant_tensor_count += 1
@@ -127,7 +130,7 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str]]:
 
     if mixed_ops_count != weight_only_mixed_ops_count: raise ValueError
 
-    return float_tensor_count, int_quant_tensor_count, mixed_ops_count, ops_found
+    return float_tensor_count, int_quant_tensor_count, mixed_ops_count, ops_found, uses_per_axis_quantization
 
 float_networks = []
 int_quant_networks = []
@@ -141,10 +144,13 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
             with open(model_path, "rb") as f:
                 tflite_model_buf = f.read()
             tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
-            float_tensor_count, quant_tensors_count, mixed_ops_count, ops = analyze(tflite_model)
+            (
+                float_tensor_count, quant_tensors_count, mixed_ops_count,
+                ops, per_axis_quant
+            ) = analyze(tflite_model)
             print(file,
-                "float_tensor_count = %d quant_tensors_count = %d mixed_ops_count = %d"
-                % (float_tensor_count, quant_tensors_count, mixed_ops_count))
+                "float_tensor_count = %d quant_tensors_count = %d mixed_ops_count = %d per_axis_quant %s"
+                % (float_tensor_count, quant_tensors_count, mixed_ops_count, per_axis_quant))
             print(ops)
             all_ops.update(ops)
             if quant_tensors_count == 0:
