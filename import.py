@@ -136,6 +136,7 @@ float_networks = []
 int_quant_networks = []
 mixed_networks = []
 all_ops = set()
+errors = []
 
 for root, dirs, files in os.walk("3rdparty/tiny"):
     for file in files:
@@ -153,15 +154,18 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
                 % (float_tensor_count, quant_tensors_count, mixed_ops_count, per_axis_quant))
             print(ops)
             all_ops.update(ops)
-            if quant_tensors_count == 0:
+            try:
+                if quant_tensors_count == 0:
+                    float_networks.append(model_path)
+                elif mixed_ops_count == 0:
+                    int_quant_networks.append(model_path)
+                else:
+                    mixed_networks.append(model_path)
                 mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
-                # mod.show()
-                float_networks.append(model_path)
-            elif mixed_ops_count == 0:
-                int_quant_networks.append(model_path)
-            else:
-                mixed_networks.append(model_path)
-
+                mod.show()
+            except tvm.error.OpNotImplemented as ex:
+                errors.append(model_path)
+                print(ex)
 
 print("all operations\n\t" + str(all_ops))
 print("float_networks")
@@ -170,3 +174,5 @@ print("int_quant_networks")
 for path in int_quant_networks: print("\t" + os.path.normpath(path))
 print("mixed_networks")
 for path in mixed_networks: print("\t" + os.path.normpath(path))
+print("errors")
+for path in errors: print("\t" + os.path.normpath(path))
