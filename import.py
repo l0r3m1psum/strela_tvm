@@ -162,6 +162,8 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
                 else:
                     mixed_networks.append(model_path)
                 mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
+                mod = tvm.relax.transform.NormalizeQQDPatterns()(mod)
+                mod = tvm.relax.transform.RewriteQDQPatterns()(mod)
                 mod.show()
             except tvm.error.OpNotImplemented as ex:
                 errors.append(model_path)

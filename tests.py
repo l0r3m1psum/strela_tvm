@@ -139,7 +139,7 @@ def test_qnn_conv2d_inference(use_bias, dtype, x_shape, w_shape, w_q_shape, ndim
         # Per-tensor
         ((32, 128), (), (128, 256), (), 2, (32, 256), 2),
         # Per-axis on weights (out_features = 256)
-        ((32, 128), (), (128, 256), (256,), 2, (32, 256), 2),
+        ((32, 128), (), (128, 256), (1, 256), 2, (32, 256), 2),
         # Per-block on weights (block size 32 over K dimension -> 128/32 = 4)
         ((32, 128), (), (128, 256), (4, 256), 2, (32, 256), 2),
         # Per-block on activations (block size 32 over K dim)
