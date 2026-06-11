@@ -154,8 +154,6 @@ def test_qnn_conv2d_inference(use_bias, dtype, x_shape, w_shape, w_q_shape, ndim
 def test_qnn_linear_inference(use_bias, dtype, x_shape, x_q_shape, w_shape, w_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
-    alpha = relax.Var("alpha", relax.TensorStructInfo((), "float32"))
-
     x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
     x_scale, x_zp = _make_qparam_vars("x", x_q_shape, dtype)
 
@@ -175,13 +173,13 @@ def test_qnn_linear_inference(use_bias, dtype, x_shape, x_q_shape, w_shape, w_q_
     else:
         B = None
 
-    params = [alpha, x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp]
+    params = [x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp]
     if B is not None:
         params.append(B)
 
     with bb.function("main", params=params):
         out = relax.op.qnn.linear(
-            alpha, x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, B=B
+            x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, B=B
         )
         bb.emit_func_output(out)
 
@@ -281,15 +279,13 @@ def test_qnn_avg_pool2d_inference(dtype, x_shape, x_q_shape, ndim, expected_shap
 def test_qnn_softmax_inference(dtype, x_shape, x_q_shape, ndim, expected_shape, expected_ndim):
     bb = relax.BlockBuilder()
 
-    beta = relax.Var("beta", relax.TensorStructInfo((), "float32"))
-
     x = relax.Var("x", _make_sinfo(x_shape, dtype, ndim))
     x_scale, x_zp = _make_qparam_vars("x", x_q_shape, dtype)
 
     y_scale, y_zp = _make_qparam_vars("y", (), dtype)
 
-    with bb.function("main", params=[beta, x, x_scale, x_zp, y_scale, y_zp]):
-        out = relax.op.qnn.softmax(beta, x, x_scale, x_zp, y_scale, y_zp, axis=-1)
+    with bb.function("main", params=[x, x_scale, x_zp, y_scale, y_zp]):
+        out = relax.op.qnn.softmax(x, x_scale, x_zp, y_scale, y_zp, axis=-1)
         bb.emit_func_output(out)
 
     func = bb.get()["main"]
