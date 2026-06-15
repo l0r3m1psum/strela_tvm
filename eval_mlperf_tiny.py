@@ -10,7 +10,7 @@ import pickle
 import random
 import sys
 
-def mock_compiler_inference(input_batch, task):
+def mock_compiler_inference(model_path, input_batch, task):
     batch_size = len(input_batch)
     if task == "image_classification":
         return np.random.rand(batch_size, 10)
@@ -95,15 +95,14 @@ def evaluate_cifar10(dataset_path, tflite_models, num_samples=500):
     
     print(f"Loaded {len(y_true)} test samples.")
     
-    mock_preds = mock_compiler_inference(images, "image_classification")
-    mock_acc = accuracy_score(y_true, np.argmax(mock_preds, axis=1))
-    print(f"  [Mock Compiler] Accuracy: {mock_acc * 100:.2f}%")
-    
     for model_path in tflite_models:
-        print(f"  [TFLite] Running {model_path.name}...")
+        print(f"Running {model_path.name}...")
+        mock_preds = mock_compiler_inference(model_path, images, "image_classification")
+        mock_acc = accuracy_score(y_true, np.argmax(mock_preds, axis=1))
+        print(f"    -> [TVM]    Accuracy: {mock_acc * 100:.2f}%")
         tflite_preds = run_tflite_inference(model_path, images, "image_classification")
         tflite_acc = accuracy_score(y_true, np.argmax(tflite_preds, axis=1))
-        print(f"    -> Accuracy: {tflite_acc * 100:.2f}%")
+        print(f"    -> [TFLite] Accuracy: {tflite_acc * 100:.2f}%")
 
 
 def evaluate_vww(dataset_path, tflite_models, num_samples=500):
@@ -135,18 +134,14 @@ def evaluate_vww(dataset_path, tflite_models, num_samples=500):
         dtype=np.float32
     ) / 255.0
     
-    mock_preds = mock_compiler_inference(images, "visual_wake_words")
-    mock_acc = accuracy_score(y_true, np.argmax(mock_preds, axis=1))
-    print(f"  [Mock Compiler] Accuracy: {mock_acc * 100:.2f}%")
-    
     for model_path in tflite_models:
-        if not model_path.exists():
-            print(f"  [TFLite] Not found: {model_path.name}")
-            continue
-        print(f"  [TFLite] Running {model_path.name}...")
+        print(f"Running {model_path.name}...")
+        mock_preds = mock_compiler_inference(model_path, images, "visual_wake_words")
+        mock_acc = accuracy_score(y_true, np.argmax(mock_preds, axis=1))
+        print(f"    -> [TVM]    Accuracy: {mock_acc * 100:.2f}%")
         tflite_preds = run_tflite_inference(model_path, images, "visual_wake_words")
         tflite_acc = accuracy_score(y_true, np.argmax(tflite_preds, axis=1))
-        print(f"    -> Accuracy: {tflite_acc * 100:.2f}%")
+        print(f"    -> [TFLite] Accuracy: {tflite_acc * 100:.2f}%")
 
 def file_to_vector_array(file_name, n_mels=128, frames=5, n_fft=1024, hop_length=512, power=2.0):
     """
@@ -216,14 +211,21 @@ def evaluate_anomaly_detection(dataset_path, tflite_models, num_samples=100):
     print(f"Successfully processed {len(all_features)} files.")
 
     for model_path in tflite_models:
-        print(f"  [TFLite] Running {model_path.name}...")
+        print(f"   Running {model_path.name}...")
+
+        file_anomaly_scores = []
+        for file_vectors in all_features:
+            window_errors = mock_compiler_inference(model_path, file_vectors, "anomaly_detection")
+            file_anomaly_scores.append(np.mean(window_errors))
+        mock_auroc = roc_auc_score(y_true, file_anomaly_scores)
+        print(f"    -> [TVM]    AUROC: {mock_auroc:.4f}%")
 
         file_anomaly_scores = []
         for file_vectors in all_features:
             window_errors = run_tflite_inference(model_path, file_vectors, "anomaly_detection")
             file_anomaly_scores.append(np.mean(window_errors))
-
-        print(f"    -> ROC AUC: {roc_auc_score(y_true, file_anomaly_scores):.4f}")
+        tflite_auroc = roc_auc_score(y_true, file_anomaly_scores)
+        print(f"    -> [TFLite] AUROC: {tflite_auroc:.4f}")
 
 if __name__ == "__main__":
     BASE_DIR = Path.cwd()
