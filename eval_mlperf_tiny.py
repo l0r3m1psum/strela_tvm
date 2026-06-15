@@ -3,6 +3,8 @@ from PIL import Image
 from sklearn.metrics import accuracy_score, roc_auc_score
 import librosa
 import numpy
+import tflite
+import tvm.relax.frontend.tflite
 
 import pathlib
 import os
@@ -10,27 +12,64 @@ import pickle
 import random
 import sys
 
-def mock_compiler_inference(model_path, input_batch, task):
-    batch_size = len(input_batch)
-    if task == "image_classification":
-        return numpy.random.rand(batch_size, 10)
-    elif task == "visual_wake_words":
-        return numpy.random.rand(batch_size, 2)
-    elif task == "anomaly_detection":
-        return numpy.random.rand(batch_size)
-    else:
-        raise ValueError(f"Unknown task: {task}")
+def mock_compiler_inference(model_path, input_batches, task):
+    with open(model_path, "rb") as f:
+        tflite_model_buf = f.read()
+    tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
 
-def run_tflite_inference(model_path, input_data, task):
+    try:
+        mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
+        mod = tvm.relax.transform.NormalizeQDQPatterns()(mod)
+        mod = tvm.relax.transform.RewriteQDQPatternsToQNNOps()(mod)
+        mod = tvm.relax.transform.LowerQNNOps()(mod)
+    except tvm.error.OpNotImplemented as ex:
+        pass
+
+    results = []
+
+    for batch in input_batches:
+        B = len(batch)
+
+        if task == "image_classification":
+            # Mock output: Probability vector of size 10 (CIFAR-10)
+            compiler_output = numpy.random.rand(B, 10)
+            results.extend(compiler_output)
+
+        elif task == "visual_wake_words":
+            # Mock output: Probability vector of size 2 (Person vs Not Person)
+            compiler_output = numpy.random.rand(B, 2)
+            results.extend(compiler_output)
+
+        elif task == "anomaly_detection":
+            # Mock output: Autoencoder reconstruction matching input shape
+            # E.g., if batch is (146, 640), the output must be (146, 640)
+            compiler_output = numpy.random.rand(*batch.shape)
+            mse_score = numpy.mean((batch - compiler_output)**2)
+            results.append(mse_score)
+
+        else:
+            raise ValueError(f"Unknown task: {task}")
+
+    return numpy.array(results)
+
+def run_tflite_inference(model_path, input_batches, task):
+    """
+    Executes TFLite inference using batched inputs.
+
+    For Classification: input_batches is a list of image batches.
+    For Anomaly Detection: input_batches is a list where each element is
+                           all sliding windows for a SINGLE audio file.
+    """
     interpreter = Interpreter(model_path=str(model_path))
+
     interpreter.allocate_tensors()
-    
+
     input_details = interpreter.get_input_details()[0]
     output_details = interpreter.get_output_details()[0]
-    
+
     input_dtype = input_details['dtype']
-    expected_shape = tuple(input_details['shape'])
-    
+    expected_shape = tuple(input_details['shape']) # e.g., (1, 640) or (1, 96, 96, 3)
+
     in_quant = input_details.get('quantization_parameters', {})
     in_scale = in_quant.get('scales', [1.0])[0] if len(in_quant.get('scales', [])) > 0 else 1.0
     in_zp = in_quant.get('zero_points', [0])[0] if len(in_quant.get('zero_points', [])) > 0 else 0
@@ -40,42 +79,55 @@ def run_tflite_inference(model_path, input_data, task):
     out_zp = out_quant.get('zero_points', [0])[0] if len(out_quant.get('zero_points', [])) > 0 else 0
 
     results = []
-    
-    for i, sample in enumerate(input_data):
-        # Reshape to strictly match interpreter expectation (e.g. adding batch dim)
-        sample_reshaped = numpy.reshape(sample, expected_shape)
+    current_batch_size = expected_shape[0]
 
-        if input_dtype == numpy.int8 and sample_reshaped.dtype != numpy.int8:
-            sample_ready = numpy.clip(numpy.round(sample_reshaped / in_scale) + in_zp, -128, 127).astype(numpy.int8)
+    for batch in input_batches:
+        B = len(batch)
+        target_shape = [B] + list(expected_shape[1:])
+
+        if target_shape[0] != current_batch_size:
+            interpreter.resize_tensor_input(input_details['index'], target_shape)
+            interpreter.allocate_tensors()
+
+            # Refresh details after re-allocation as memory pointers may have shifted
+            input_details = interpreter.get_input_details()[0]
+            output_details = interpreter.get_output_details()[0]
+            current_batch_size = target_shape[0]
+
+        batch_reshaped = numpy.reshape(batch, target_shape)
+
+        if input_dtype == numpy.int8 and batch_reshaped.dtype != numpy.int8:
+            batch_ready = numpy.clip(numpy.round(batch_reshaped / in_scale) + in_zp, -128, 127).astype(numpy.int8)
         else:
-            sample_ready = sample_reshaped.astype(input_dtype)
-            
-        interpreter.set_tensor(input_details['index'], sample_ready)
+            batch_ready = batch_reshaped.astype(input_dtype)
+
+        interpreter.set_tensor(input_details['index'], batch_ready)
         interpreter.invoke()
-        
         output_data = interpreter.get_tensor(output_details['index']).copy()
-        
+
         if output_details['dtype'] == numpy.int8:
             output_data_float = (output_data.astype(numpy.float32) - out_zp) * out_scale
         else:
             output_data_float = output_data.astype(numpy.float32)
-            
+
         if task == "anomaly_detection":
-            if output_data_float.shape == sample_reshaped.shape:
-                # Model is an Autoencoder: Anomaly score is the MSE
-                sample_float = (
-                    (sample_ready.astype(numpy.float32) - in_zp) * in_scale
+            if output_data_float.shape == batch_reshaped.shape:
+                # Model is an Autoencoder: Anomaly score is the Mean Squared Error (MSE)
+                batch_float = (
+                    (batch_ready.astype(numpy.float32) - in_zp) * in_scale
                     if input_dtype == numpy.int8
-                    else sample_ready.astype(numpy.float32)
+                    else batch_ready.astype(numpy.float32)
                 )
-                score = numpy.mean((sample_float - output_data_float)**2)
+
+                # Compute the single file anomaly score (MSE averaged across ALL windows in the batch)
+                score = numpy.mean((batch_float - output_data_float)**2)
                 results.append(score)
             else:
-                # Model directly outputs a score
+                # Model directly outputs a score (Mean of scores if multiple windows)
                 results.append(numpy.mean(output_data_float))
         else:
-            # Classification tasks: Output probability array
-            results.append(output_data_float[0])
+            # Classification tasks: Extend list to keep individual sample probabilities flat
+            results.extend(output_data_float)
             
     return numpy.array(results)
 
@@ -96,10 +148,10 @@ def evaluate_cifar10(dataset_path, tflite_models, num_samples=500):
     
     for model_path in tflite_models:
         print(f"Running {model_path.name}...")
-        mock_preds = mock_compiler_inference(model_path, images, "image_classification")
+        mock_preds = mock_compiler_inference(model_path, [images], "image_classification")
         mock_acc = accuracy_score(y_true, numpy.argmax(mock_preds, axis=1))
         print(f"    -> [TVM]    Accuracy: {mock_acc * 100:.2f}%")
-        tflite_preds = run_tflite_inference(model_path, images, "image_classification")
+        tflite_preds = run_tflite_inference(model_path, [images], "image_classification")
         tflite_acc = accuracy_score(y_true, numpy.argmax(tflite_preds, axis=1))
         print(f"    -> [TFLite] Accuracy: {tflite_acc * 100:.2f}%")
 
@@ -134,10 +186,10 @@ def evaluate_vww(dataset_path, tflite_models, num_samples=500):
     
     for model_path in tflite_models:
         print(f"Running {model_path.name}...")
-        mock_preds = mock_compiler_inference(model_path, images, "visual_wake_words")
+        mock_preds = mock_compiler_inference(model_path, [images], "visual_wake_words")
         mock_acc = accuracy_score(y_true, numpy.argmax(mock_preds, axis=1))
         print(f"    -> [TVM]    Accuracy: {mock_acc * 100:.2f}%")
-        tflite_preds = run_tflite_inference(model_path, images, "visual_wake_words")
+        tflite_preds = run_tflite_inference(model_path, [images], "visual_wake_words")
         tflite_acc = accuracy_score(y_true, numpy.argmax(tflite_preds, axis=1))
         print(f"    -> [TFLite] Accuracy: {tflite_acc * 100:.2f}%")
 
@@ -210,18 +262,10 @@ def evaluate_anomaly_detection(dataset_path, tflite_models, num_samples=100):
 
     for model_path in tflite_models:
         print(f"   Running {model_path.name}...")
-
-        file_anomaly_scores = []
-        for file_vectors in all_features:
-            window_errors = mock_compiler_inference(model_path, file_vectors, "anomaly_detection")
-            file_anomaly_scores.append(numpy.mean(window_errors))
+        file_anomaly_scores = mock_compiler_inference(model_path, all_features, "anomaly_detection")
         mock_auroc = roc_auc_score(y_true, file_anomaly_scores)
         print(f"    -> [TVM]    AUROC: {mock_auroc:.4f}")
-
-        file_anomaly_scores = []
-        for file_vectors in all_features:
-            window_errors = run_tflite_inference(model_path, file_vectors, "anomaly_detection")
-            file_anomaly_scores.append(numpy.mean(window_errors))
+        file_anomaly_scores = run_tflite_inference(model_path, all_features, "anomaly_detection")
         tflite_auroc = roc_auc_score(y_true, file_anomaly_scores)
         print(f"    -> [TFLite] AUROC: {tflite_auroc:.4f}")
 
