@@ -5,6 +5,7 @@ import librosa
 import numpy
 import tflite
 import tvm.relax.frontend.tflite
+from tvm import relax
 
 import pathlib
 import os
@@ -12,43 +13,243 @@ import pickle
 import random
 import sys
 
+from typing import Dict, List, Tuple
+
+def get_io_quantization_params(
+    func: relax.Function
+) -> Tuple[Dict[relax.Var, Tuple], List[Tuple]]:
+    """
+    Scans a Relax function and returns the parameters of the first (if any)
+    dequantize operation applied to each function argument and the last (if any)
+    quantize operation applied to each function output.
+
+    This is needed to recover the quantization parameters to correctly input
+    data and successively interpret the outputs of the network when both input
+    and output are quantized.
+
+    The function returns the parameters of the first dequantize after any number
+    of quantization invariant operations and the last quantize before any number
+    of quantization invariant operations.
+
+    An input could be dequantized in two ways at once i.e. let i be an input
+    and dq1 and dq2 be two dequantize function with different parameters if we
+    have a dataflow graph like this
+
+        i
+       / \
+    dq1   dq2
+
+    We have to throw an error since there is no way to quantize the same input
+    in two different ways.
+
+    Quantization should really be done at the type level or at least be attached
+    to the tensors because in this way it is a mess...
+
+    Returns:
+        input_params: dict mapping relax.Var (input param) to its (scale, zero_point, axis, dtype)
+        output_params: list of (scale, zero_point, axis, dtype) for each output tuple element
+    """
+    try:
+        df_block = func.body.blocks[0]
+        # Given a variable v, udchain[v] is the list of variable that it is used
+        # to define e.g.
+        # lv2 = f(lv, lv1)
+        # lv3 = g(lv1)     => {lv: (lv2, lv4), lv1: (lv2, lv3)}
+        # lv4 = g(lv)
+        udchain: Dict[relax.Var, Tuple[relax.Var]] = relax.analysis.udchain(df_block)
+    except (TypeError, IndexError, AttributeError) as ex:
+        raise ValueError(
+            "The function should be in dataflow form i.e. a SeqExpr with "
+            "a DataflowBlock as its first block."
+        ) from ex
+
+    # Given a variable v, duchain[v] is the expression that defined it
+    # lv1 = f(lv) => {lv1: f(lv)}
+    # Because of SSA, we just map every bound variable to its value expression.
+    duchain: Dict[relax.Var, relax.Expr] = {binding.var: binding.value for binding in df_block.bindings}
+
+    # Operations that only manipulate shapes, not the quantized values
+    invariant_ops = {
+        "relax.reshape", "relax.permute_dims", "relax.expand_dims",
+        "relax.squeeze", "relax.strided_slice", "relax.split",
+    }
+
+    def extract_constant_numpy(expr):
+        return expr.data.numpy() if isinstance(expr, relax.Constant) else expr
+
+    def params_are_equal(p1, p2):
+        """Compares two sets of quantization parameters."""
+        s1, z1, a1, d1 = p1
+        s2, z2, a2, d2 = p2
+        if a1 != a2 or d1 != d2:
+            return False
+
+        def expr_eq(e1, e2):
+            return numpy.array_equal(e1, e2) \
+                if isinstance(e1, numpy.ndarray) and isinstance(e2, numpy.ndarray) \
+                else e1 == e2
+
+        return expr_eq(s1, s2) and expr_eq(z1, z2)
+
+    input_qparams = {}
+
+    def trace_forward(var):
+        """Traces through all the uses of the uses of var tracing deeper only if
+        there is an quantization invariant operations or TupleGetItem. In this
+        example i is used by three operations of which one is traced throw
+        because it is quantization invariant.
+             i
+           / | \
+        dq1 inv f
+             |
+            dq2
+        """
+        found = []
+        for use_var in udchain.get(var, []):
+            expr = duchain.get(use_var, None)
+            if isinstance(expr, relax.Call):
+                op_name = expr.op.name if hasattr(expr.op, "name") else ""
+                if op_name == "relax.dequantize":
+                    scale = extract_constant_numpy(expr.args[1])
+                    zp = extract_constant_numpy(expr.args[2])
+                    axis = expr.attrs.axis if hasattr(expr.attrs, "axis") else -1
+                    out_dt = expr.attrs.out_dtype if hasattr(expr.attrs, "out_dtype") else "float32"
+                    found.append((scale, zp, axis, out_dt))
+                elif op_name in invariant_ops:
+                    found.extend(trace_forward(use_var))
+            elif isinstance(expr, relax.TupleGetItem):
+                found.extend(trace_forward(use_var))
+        return found
+
+    for p in func.params:
+        found_params = trace_forward(p)
+
+        if found_params:
+            # Conflict Resolution logic
+            unique_params = []
+            for qp in found_params:
+                if not any(params_are_equal(qp, up) for up in unique_params):
+                    unique_params.append(qp)
+
+            if len(unique_params) > 1:
+                raise ValueError(
+                    f"Conflict detected: Input '{p.name_hint}' is dequantized with "
+                    f"multiple conflicting parameters: {unique_params}"
+                )
+
+            input_qparams[p] = unique_params[0]
+        else:
+            input_qparams[p] = ()
+
+    def trace_backward(var):
+        expr = duchain.get(var, None)
+
+        if isinstance(expr, relax.Call):
+            op_name = expr.op.name if hasattr(expr.op, "name") else ""
+            if op_name == "relax.quantize":
+                scale = extract_constant_numpy(expr.args[1])
+                zp = extract_constant_numpy(expr.args[2])
+                axis = expr.attrs.axis if hasattr(expr.attrs, "axis") else -1
+                out_dt = expr.attrs.out_dtype if hasattr(expr.attrs, "out_dtype") else "int8"
+                return [(scale, zp, axis, out_dt)]
+            elif op_name in invariant_ops:
+                if isinstance(expr.args[0], relax.Var):
+                    return trace_backward(expr.args[0])
+        elif isinstance(expr, relax.TupleGetItem):
+            if isinstance(expr.tuple_value, relax.Var):
+                return trace_backward(expr.tuple_value)
+
+        return []
+
+    out_expr = func.body.body
+    out_vars = []
+    if isinstance(out_expr, relax.Var):
+        out_vars = [out_expr]
+    elif isinstance(out_expr, relax.Tuple):
+        out_vars = [f for f in out_expr.fields if isinstance(f, relax.Var)]
+
+    output_qparams = []
+    for out_v in out_vars:
+        found_params = trace_backward(out_v)
+        output_qparams.append(found_params[0] if found_params else ())
+
+    return input_qparams, output_qparams
+
+def quantize(x, s, zp):
+    return numpy.clip(numpy.round(x/s) + zp, -128, 127).astype(numpy.int8)
+
+def dequantize(q, s, zp):
+    return (q.astype(numpy.float32) - zp)*s
+
 def mock_compiler_inference(model_path, input_batches, task):
     with open(model_path, "rb") as f:
         tflite_model_buf = f.read()
     tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
 
     try:
-        mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
-        mod = tvm.relax.transform.NormalizeQDQPatterns()(mod)
-        mod = tvm.relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-        mod = tvm.relax.transform.LowerQNNOps()(mod)
+        mod = relax.frontend.tflite.from_tflite(tflite_model)
+        mod = relax.transform.NormalizeQDQPatterns()(mod)
+        input_qparams, output_qparams = get_io_quantization_params(mod["main"])
+        mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
+        mod = relax.transform.LowerQNNOps()(mod)
+        ex = tvm.compile(mod, tvm.target.Target("llvm"))
+        vm = relax.VirtualMachine(ex, tvm.cpu())
+
+        if len(input_qparams) != 1: raise ValueError("")
+        if len(output_qparams) != 1: raise ValueError("")
+        i_scale, i_zero_point, i_axis, i_out_dtype = next(iter(input_qparams.values()))
+        o_scale, o_zero_point, o_axis, o_out_dtype = output_qparams[0]
     except tvm.error.OpNotImplemented as ex:
-        pass
+        mod = None
+        vm = None
 
     results = []
 
     for batch in input_batches:
-        B = len(batch)
+        if mod is not None:
+            input_struct_info = mod["main"].struct_info.params[0]
+            output_struct_info = mod["main"].struct_info.ret
 
-        if task == "image_classification":
-            # Mock output: Probability vector of size 10 (CIFAR-10)
-            compiler_output = numpy.random.rand(B, 10)
-            results.extend(compiler_output)
+            if input_struct_info.dtype == "int8" and batch.dtype != "int8":
+                input_data = quantize(batch, i_scale, i_zero_point)
+            else:
+                input_data = batch
 
-        elif task == "visual_wake_words":
-            # Mock output: Probability vector of size 2 (Person vs Not Person)
-            compiler_output = numpy.random.rand(B, 2)
-            results.extend(compiler_output)
+            output_data = []
+            for datum in input_data:
+                datum = datum[numpy.newaxis, :]
+                datum = tvm.runtime.tensor(datum, tvm.cpu())
+                out = vm["main"](datum)
+                output_data.append(out.numpy())
+            output_data = numpy.concatenate(output_data, axis=0)
 
-        elif task == "anomaly_detection":
-            # Mock output: Autoencoder reconstruction matching input shape
-            # E.g., if batch is (146, 640), the output must be (146, 640)
-            compiler_output = numpy.random.rand(*batch.shape)
-            mse_score = numpy.mean((batch - compiler_output)**2)
-            results.append(mse_score)
+            if output_struct_info.dtype == "int8":
+                output_data = dequantize(output_data, o_scale, o_zero_point)
 
+            if task == "anomaly_detection":
+                mse_score = numpy.mean((batch - output_data)**2)
+                results.append(mse_score)
+            else:
+                results.extend(output_data)
         else:
-            raise ValueError(f"Unknown task: {task}")
+            print("compilation failed returning random results!")
+            B = len(batch)
+            if task == "image_classification":
+                # Mock output: Probability vector of size 10 (CIFAR-10)
+                compiler_output = numpy.random.rand(B, 10)
+                results.extend(compiler_output)
+            elif task == "visual_wake_words":
+                # Mock output: Probability vector of size 2 (Person vs Not Person)
+                compiler_output = numpy.random.rand(B, 2)
+                results.extend(compiler_output)
+            elif task == "anomaly_detection":
+                # Mock output: Autoencoder reconstruction matching input shape
+                # E.g., if batch is (146, 640), the output must be (146, 640)
+                compiler_output = numpy.random.rand(*batch.shape)
+                mse_score = numpy.mean((batch - compiler_output)**2)
+                results.append(mse_score)
+            else:
+                raise ValueError(f"Unknown task: {task}")
 
     return numpy.array(results)
 
@@ -97,7 +298,7 @@ def run_tflite_inference(model_path, input_batches, task):
         batch_reshaped = numpy.reshape(batch, target_shape)
 
         if input_dtype == numpy.int8 and batch_reshaped.dtype != numpy.int8:
-            batch_ready = numpy.clip(numpy.round(batch_reshaped / in_scale) + in_zp, -128, 127).astype(numpy.int8)
+            batch_ready = quantize(batch_reshaped, in_scale, in_zp)
         else:
             batch_ready = batch_reshaped.astype(input_dtype)
 
@@ -106,7 +307,7 @@ def run_tflite_inference(model_path, input_batches, task):
         output_data = interpreter.get_tensor(output_details['index']).copy()
 
         if output_details['dtype'] == numpy.int8:
-            output_data_float = (output_data.astype(numpy.float32) - out_zp) * out_scale
+            output_data_float = dequantize(output_data, out_scale, out_zp)
         else:
             output_data_float = output_data.astype(numpy.float32)
 
@@ -114,7 +315,7 @@ def run_tflite_inference(model_path, input_batches, task):
             if output_data_float.shape == batch_reshaped.shape:
                 # Model is an Autoencoder: Anomaly score is the Mean Squared Error (MSE)
                 batch_float = (
-                    (batch_ready.astype(numpy.float32) - in_zp) * in_scale
+                    dequantize(batch_ready, in_scale, in_zp)
                     if input_dtype == numpy.int8
                     else batch_ready.astype(numpy.float32)
                 )
@@ -123,6 +324,7 @@ def run_tflite_inference(model_path, input_batches, task):
                 score = numpy.mean((batch_float - output_data_float)**2)
                 results.append(score)
             else:
+                raise RuntimeError("If this is reached it should be implemented also in the compiler function")
                 # Model directly outputs a score (Mean of scores if multiple windows)
                 results.append(numpy.mean(output_data_float))
         else:
