@@ -188,18 +188,20 @@ def mock_compiler_inference(model_path, input_batches, task):
 
     try:
         mod = relax.frontend.tflite.from_tflite(tflite_model)
-        mod = relax.transform.NormalizeQDQPatterns()(mod)
+        # mod.show()
+        # mod = relax.transform.NormalizeQDQPatterns()(mod)
+        # mod.show()
         input_qparams, output_qparams = get_io_quantization_params(mod["main"])
-        mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-        mod = relax.transform.LowerQNNOps()(mod)
+        # mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
+        # mod = relax.transform.LowerQNNOps()(mod)
         ex = tvm.compile(mod, tvm.target.Target("llvm"))
         vm = relax.VirtualMachine(ex, tvm.cpu())
 
         if len(input_qparams) != 1: raise ValueError("")
         if len(output_qparams) != 1: raise ValueError("")
-        i_scale, i_zero_point, i_axis, i_out_dtype = next(iter(input_qparams.values()))
-        o_scale, o_zero_point, o_axis, o_out_dtype = output_qparams[0]
     except tvm.error.OpNotImplemented as ex:
+        print("compilation failed returning random results!")
+        print(ex)
         mod = None
         vm = None
 
@@ -211,9 +213,10 @@ def mock_compiler_inference(model_path, input_batches, task):
             output_struct_info = mod["main"].struct_info.ret
 
             if input_struct_info.dtype == "int8" and batch.dtype != "int8":
+                i_scale, i_zero_point, i_axis, i_out_dtype = next(iter(input_qparams.values()))
                 input_data = quantize(batch, i_scale, i_zero_point)
             else:
-                input_data = batch
+                input_data = batch.astype(numpy.float32)
 
             output_data = []
             for datum in input_data:
@@ -224,6 +227,7 @@ def mock_compiler_inference(model_path, input_batches, task):
             output_data = numpy.concatenate(output_data, axis=0)
 
             if output_struct_info.dtype == "int8":
+                o_scale, o_zero_point, o_axis, o_out_dtype = output_qparams[0]
                 output_data = dequantize(output_data, o_scale, o_zero_point)
 
             if task == "anomaly_detection":
@@ -232,7 +236,6 @@ def mock_compiler_inference(model_path, input_batches, task):
             else:
                 results.extend(output_data)
         else:
-            print("compilation failed returning random results!")
             B = len(batch)
             if task == "image_classification":
                 # Mock output: Probability vector of size 10 (CIFAR-10)
@@ -262,7 +265,6 @@ def run_tflite_inference(model_path, input_batches, task):
                            all sliding windows for a SINGLE audio file.
     """
     interpreter = Interpreter(model_path=str(model_path))
-
     interpreter.allocate_tensors()
 
     input_details = interpreter.get_input_details()[0]
