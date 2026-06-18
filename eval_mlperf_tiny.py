@@ -72,6 +72,8 @@ def get_io_quantization_params(
     invariant_ops = {
         "relax.reshape", "relax.permute_dims", "relax.expand_dims",
         "relax.squeeze", "relax.strided_slice", "relax.split",
+
+        # "relax.nn.relu", "relax.clip", "relax.maximum", "relax.minimum",
     }
 
     def extract_constant_numpy(expr):
@@ -181,91 +183,27 @@ def quantize(x, s, zp):
 def dequantize(q, s, zp):
     return (q.astype(numpy.float32) - zp)*s
 
-def mock_compiler_inference(model_path, input_batches, task):
-    with open(model_path, "rb") as f:
-        tflite_model_buf = f.read()
-    tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
-
-    try:
-        mod = relax.frontend.tflite.from_tflite(tflite_model)
-        # mod.show()
-        # mod = relax.transform.NormalizeQDQPatterns()(mod)
-        # mod.show()
-        input_qparams, output_qparams = get_io_quantization_params(mod["main"])
-        # mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-        # mod = relax.transform.LowerQNNOps()(mod)
-        ex = tvm.compile(mod, tvm.target.Target("llvm"))
-        vm = relax.VirtualMachine(ex, tvm.cpu())
-
-        if len(input_qparams) != 1: raise ValueError("")
-        if len(output_qparams) != 1: raise ValueError("")
-    except tvm.error.OpNotImplemented as ex:
-        print("compilation failed returning random results!")
-        print(ex)
-        mod = None
-        vm = None
-
-    results = []
-
-    for batch in input_batches:
-        if mod is not None:
-            input_struct_info = mod["main"].struct_info.params[0]
-            output_struct_info = mod["main"].struct_info.ret
-
-            if input_struct_info.dtype == "int8" and batch.dtype != "int8":
-                i_scale, i_zero_point, i_axis, i_out_dtype = next(iter(input_qparams.values()))
-                input_data = quantize(batch, i_scale, i_zero_point)
-            else:
-                input_data = batch.astype(numpy.float32)
-
-            output_data = []
-            for datum in input_data:
-                datum = datum[numpy.newaxis, :]
-                datum = tvm.runtime.tensor(datum, tvm.cpu())
-                out = vm["main"](datum)
-                output_data.append(out.numpy())
-            output_data = numpy.concatenate(output_data, axis=0)
-
-            if output_struct_info.dtype == "int8":
-                o_scale, o_zero_point, o_axis, o_out_dtype = output_qparams[0]
-                output_data = dequantize(output_data, o_scale, o_zero_point)
-
-            if task == "anomaly_detection":
-                mse_score = numpy.mean((batch - output_data)**2)
-                results.append(mse_score)
-            else:
-                results.extend(output_data)
-        else:
-            B = len(batch)
-            if task == "image_classification":
-                # Mock output: Probability vector of size 10 (CIFAR-10)
-                compiler_output = numpy.random.rand(B, 10)
-                results.extend(compiler_output)
-            elif task == "visual_wake_words":
-                # Mock output: Probability vector of size 2 (Person vs Not Person)
-                compiler_output = numpy.random.rand(B, 2)
-                results.extend(compiler_output)
-            elif task == "anomaly_detection":
-                # Mock output: Autoencoder reconstruction matching input shape
-                # E.g., if batch is (146, 640), the output must be (146, 640)
-                compiler_output = numpy.random.rand(*batch.shape)
-                mse_score = numpy.mean((batch - compiler_output)**2)
-                results.append(mse_score)
-            else:
-                raise ValueError(f"Unknown task: {task}")
-
-    return numpy.array(results)
-
 def run_tflite_inference(model_path, input_batches, task):
     """
-    Executes TFLite inference using batched inputs.
-
     For Classification: input_batches is a list of image batches.
     For Anomaly Detection: input_batches is a list where each element is
                            all sliding windows for a SINGLE audio file.
     """
     interpreter = Interpreter(model_path=str(model_path))
     interpreter.allocate_tensors()
+
+    with open(model_path, "rb") as f:
+        tflite_model_buf = f.read()
+    tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
+    mod = relax.frontend.tflite.from_tflite(tflite_model)
+    # mod = relax.transform.NormalizeQDQPatterns()(mod)
+    inputs_qparams, outputs_qparams = get_io_quantization_params(mod["main"])
+    input_qparams = next(iter(inputs_qparams.values()))
+    output_qparams = outputs_qparams[0]
+    # mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
+    # mod = relax.transform.LowerQNNOps()(mod)
+    ex = tvm.compile(mod, tvm.target.Target("llvm"))
+    vm = relax.VirtualMachine(ex, tvm.cpu())
 
     input_details = interpreter.get_input_details()[0]
     output_details = interpreter.get_output_details()[0]
@@ -274,14 +212,37 @@ def run_tflite_inference(model_path, input_batches, task):
     expected_shape = tuple(input_details['shape']) # e.g., (1, 640) or (1, 96, 96, 3)
 
     in_quant = input_details.get('quantization_parameters', {})
-    in_scale = in_quant.get('scales', [1.0])[0] if len(in_quant.get('scales', [])) > 0 else 1.0
-    in_zp = in_quant.get('zero_points', [0])[0] if len(in_quant.get('zero_points', [])) > 0 else 0
+    in_scale_tf = in_quant.get('scales', [1.0])[0] if len(in_quant.get('scales', [])) > 0 else 1.0
+    in_zp_tf = in_quant.get('zero_points', [0])[0] if len(in_quant.get('zero_points', [])) > 0 else 0
 
     out_quant = output_details.get('quantization_parameters', {})
-    out_scale = out_quant.get('scales', [1.0])[0] if len(out_quant.get('scales', [])) > 0 else 1.0
-    out_zp = out_quant.get('zero_points', [0])[0] if len(out_quant.get('zero_points', [])) > 0 else 0
+    out_scale_tf = out_quant.get('scales', [1.0])[0] if len(out_quant.get('scales', [])) > 0 else 1.0
+    out_zp_tf = out_quant.get('zero_points', [0])[0] if len(out_quant.get('zero_points', [])) > 0 else 0
 
-    results = []
+    if input_qparams:
+        in_scale_tvm, in_zp_tvm, in_axis_tvm, in_out_dtype_tvm = input_qparams
+    else:
+        in_scale_tvm, in_zp_tvm, in_axis_tvm, in_out_dtype_tvm = 1.0, 0, -1, "float32"
+
+    if output_qparams:
+        out_scale_tvm, out_zp_tvm, out_axis_tvm, out_out_dtype_tvm = output_qparams
+    else:
+        out_scale_tvm, out_zp_tvm, out_axis_tvm, out_out_dtype_tvm = 1.0, 0, -1, "int8"
+
+    if in_scale_tf != in_scale_tvm or in_zp_tf != in_zp_tvm:
+        raise RuntimeError(
+            "Input quantization parameters differ from LiteRT to TVM %f %d vs %f %d"
+            % (in_scale_tf, in_zp_tf, in_scale_tvm, in_zp_tvm)
+        )
+
+    if out_scale_tf != out_scale_tvm or out_zp_tf != out_zp_tvm:
+        raise RuntimeError(
+            "Output quantization parameters differ from LiteRT to TVM %f %d vs %f %d"
+            % (out_scale_tf, out_zp_tf, out_scale_tvm, out_zp_tvm)
+        )
+
+    results_tf = []
+    results_tvm = []
     current_batch_size = expected_shape[0]
 
     for batch in input_batches:
@@ -300,40 +261,49 @@ def run_tflite_inference(model_path, input_batches, task):
         batch_reshaped = numpy.reshape(batch, target_shape)
 
         if input_dtype == numpy.int8 and batch_reshaped.dtype != numpy.int8:
-            batch_ready = quantize(batch_reshaped, in_scale, in_zp)
+            batch_ready = quantize(batch_reshaped, in_scale_tf, in_zp_tf)
         else:
             batch_ready = batch_reshaped.astype(input_dtype)
 
         interpreter.set_tensor(input_details['index'], batch_ready)
         interpreter.invoke()
-        output_data = interpreter.get_tensor(output_details['index']).copy()
+        output_data_tf = interpreter.get_tensor(output_details['index']).copy()
 
-        if output_details['dtype'] == numpy.int8:
-            output_data_float = dequantize(output_data, out_scale, out_zp)
-        else:
-            output_data_float = output_data.astype(numpy.float32)
+        output_data_tvm = []
+        for datum in batch_ready:
+            datum = datum[numpy.newaxis, :]
+            datum = tvm.runtime.tensor(datum, tvm.cpu())
+            out = vm["main"](datum)
+            output_data_tvm.append(out.numpy())
+        output_data_tvm = numpy.concatenate(output_data_tvm, axis=0)
 
-        if task == "anomaly_detection":
-            if output_data_float.shape == batch_reshaped.shape:
-                # Model is an Autoencoder: Anomaly score is the Mean Squared Error (MSE)
-                batch_float = (
-                    dequantize(batch_ready, in_scale, in_zp)
-                    if input_dtype == numpy.int8
-                    else batch_ready.astype(numpy.float32)
-                )
 
-                # Compute the single file anomaly score (MSE averaged across ALL windows in the batch)
-                score = numpy.mean((batch_float - output_data_float)**2)
-                results.append(score)
+        for output_data, results in ((output_data_tf, results_tf,), (output_data_tvm, results_tvm,),):
+            if output_data.dtype == numpy.int8:
+                output_data_float = dequantize(output_data, out_scale_tf, out_zp_tf)
             else:
-                raise RuntimeError("If this is reached it should be implemented also in the compiler function")
-                # Model directly outputs a score (Mean of scores if multiple windows)
-                results.append(numpy.mean(output_data_float))
-        else:
-            # Classification tasks: Extend list to keep individual sample probabilities flat
-            results.extend(output_data_float)
+                output_data_float = output_data.astype(numpy.float32)
+
+            if task == "anomaly_detection":
+                if output_data_float.shape == batch_reshaped.shape:
+                    # Model is an Autoencoder: Anomaly score is the Mean Squared Error (MSE)
+                    batch_float = (
+                        dequantize(batch_ready, in_scale_tf, in_zp_tf)
+                        if input_dtype == numpy.int8
+                        else batch_ready.astype(numpy.float32)
+                    )
+
+                    # Compute the single file anomaly score (MSE averaged across ALL windows in the batch)
+                    score = numpy.mean((batch_float - output_data_float)**2)
+                    results.append(score)
+                else:
+                    # Model directly outputs a score (Mean of scores if multiple windows)
+                    results.append(numpy.mean(output_data_float))
+            else:
+                # Classification tasks: Extend list to keep individual sample probabilities flat
+                results.extend(output_data_float)
             
-    return numpy.array(results)
+    return numpy.array(results_tf), numpy.array(results_tvm)
 
 def evaluate_cifar10(dataset_path, tflite_models, num_samples=500):
     print("\n" + "="*50)
@@ -352,10 +322,9 @@ def evaluate_cifar10(dataset_path, tflite_models, num_samples=500):
     
     for model_path in tflite_models:
         print(f"Running {model_path.name}...")
-        mock_preds = mock_compiler_inference(model_path, [images], "image_classification")
+        tflite_preds, mock_preds = run_tflite_inference(model_path, [images], "image_classification")
         mock_acc = accuracy_score(y_true, numpy.argmax(mock_preds, axis=1))
         print(f"    -> [TVM]    Accuracy: {mock_acc * 100:.2f}%")
-        tflite_preds = run_tflite_inference(model_path, [images], "image_classification")
         tflite_acc = accuracy_score(y_true, numpy.argmax(tflite_preds, axis=1))
         print(f"    -> [TFLite] Accuracy: {tflite_acc * 100:.2f}%")
 
@@ -390,10 +359,9 @@ def evaluate_vww(dataset_path, tflite_models, num_samples=500):
     
     for model_path in tflite_models:
         print(f"Running {model_path.name}...")
-        mock_preds = mock_compiler_inference(model_path, [images], "visual_wake_words")
+        tflite_preds, mock_preds = run_tflite_inference(model_path, [images], "visual_wake_words")
         mock_acc = accuracy_score(y_true, numpy.argmax(mock_preds, axis=1))
         print(f"    -> [TVM]    Accuracy: {mock_acc * 100:.2f}%")
-        tflite_preds = run_tflite_inference(model_path, [images], "visual_wake_words")
         tflite_acc = accuracy_score(y_true, numpy.argmax(tflite_preds, axis=1))
         print(f"    -> [TFLite] Accuracy: {tflite_acc * 100:.2f}%")
 
@@ -466,11 +434,10 @@ def evaluate_anomaly_detection(dataset_path, tflite_models, num_samples=100):
 
     for model_path in tflite_models:
         print(f"   Running {model_path.name}...")
-        file_anomaly_scores = mock_compiler_inference(model_path, all_features, "anomaly_detection")
-        mock_auroc = roc_auc_score(y_true, file_anomaly_scores)
+        tflite_scores, mock_scores = run_tflite_inference(model_path, all_features, "anomaly_detection")
+        mock_auroc = roc_auc_score(y_true, mock_scores)
         print(f"    -> [TVM]    AUROC: {mock_auroc:.4f}")
-        file_anomaly_scores = run_tflite_inference(model_path, all_features, "anomaly_detection")
-        tflite_auroc = roc_auc_score(y_true, file_anomaly_scores)
+        tflite_auroc = roc_auc_score(y_true, tflite_scores)
         print(f"    -> [TFLite] AUROC: {tflite_auroc:.4f}")
 
 if __name__ == "__main__":
@@ -495,10 +462,11 @@ if __name__ == "__main__":
         TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint.tflite",
         TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro.tflite",
         TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro_intio.tflite",
-        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant.tflite",
+        # TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant.tflite",
     )
     
     # Execute (capped at 500 samples by default so you aren't waiting 5 minutes per run)
     evaluate_cifar10(IC_DIR, ic_models)
-    evaluate_vww(VWW_DIR, vww_models)
+    # TODO: support depthwise convolution in the tflite importer.
+    # evaluate_vww(VWW_DIR, vww_models)
     evaluate_anomaly_detection(AD_DIR, ad_models)
