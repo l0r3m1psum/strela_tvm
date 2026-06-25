@@ -1,3 +1,42 @@
+"""As with many things neural networks the tflite format is a mess... It is
+based on FlatBuffers this creates some interesting headaches given the fact that
+the format aims to be both forward and backward compatible. In particular the
+tflite.Model.Version() will pretty much always return 3 because previous
+versions (i.e. 0, 1 and 2 should all be beta versions) and versions after the 3
+need to be discriminated looking at the operator versions (i.e. if an operator
+with a certain version that we know was not available until version 3c we know
+that the model version is at least that).
+
+On the topic of operator versions if we are reading a tflite file with a certain
+version, say 3a, using a version of the tflite module that has a been compiled
+with newer schema, say 3d, and we query for an operator option say
+QuantizedBiasType of CONV_2D we are going to get the default, which is
+tflite.TensorType.FLOAT32 i.e. 0. But we cannot take it at face value since we
+first have to check that the operator version is at least 8. In this particular
+case the default is the worst possible since it should have been
+tflite.TensorType.INT32.
+
+AFAWK there is no automated way to check this kind of version inconsistencies.
+The only way is reading the comments in the FlatBuffers schema and adding the
+checks to your code.
+
+TFLite Flatbuffers schema
+https://github.com/tensorflow/tensorflow/blob/0e79e851ea0f040c1dd5092cf135137af5e8b4af/tensorflow/compiler/mlir/lite/schema/schema.fbs
+
+To add insult to the injury
+[LiteRT runtime uses mixed rounding modes across ops](https://github.com/google-ai-edge/LiteRT/issues/7441).
+This basically means that given an operation, say CONV2D, based on the available
+delegates e.g. XNNPACK or gemmlowp a kernel with different rounding behavior
+(with either single rounding or double rounding) is used this is impossible to
+statically looking at the .tflite file and even the tensorflow MLIR based
+compiler guesses what to do. To add even more insult to the injury
+[FULLY_CONNECTED reference kernel should use MultiplyByQuantizedMultiplier
+instead of std::round for requantization](https://github.com/tensorflow/tensorflow/issues/119412)
+which means that this single operation has a semantic similar to the ONNX one
+compared to the others which use the multiplier decomposition...
+
+NOTE: all operator version in MLPerf Tiny 1.3 are <= 4
+"""
 import os
 import pprint
 from typing import Tuple, Set
@@ -11,6 +50,16 @@ def is_tensor_constant(model: tflite.Model, tensor: tflite.Tensor) -> bool:
     return buffer is not None and buffer.DataLength() > 0
 
 def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str], bool]:
+    schema_version = model.Version()
+    for i in range(tflite_model.MetadataLength()):
+        meta = model.Metadata(i)
+        if meta.Name().decode("utf-8") == "min_runtime_version":
+            buffer_index = meta.Buffer()
+            metadata = model.Buffers(buffer_index)
+            min_runtime_version = metadata.DataAsNumpy().tobytes().decode('utf-8').rstrip('\x00')
+            break
+    print(schema_version, min_runtime_version)
+
     subgraph = model.Subgraphs(0)
 
     type_dict = {v: k for k, v in tflite.TensorType.__dict__.items() if not k.startswith('__')}
@@ -72,6 +121,9 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str], bool]:
         opcode_index = op.OpcodeIndex()
         op_code_enum = operator_codes[opcode_index]
         op_name = opcode_dict[op_code_enum]
+        op_version = model.OperatorCodes(opcode_index).Version()
+
+        print(op_name, op_version)
 
         ops_found.add(op_name)
 
@@ -92,6 +144,19 @@ def analyze(model: tflite.Model) -> Tuple[int, int, int, Set[str], bool]:
                     if fused_activation_enum != tflite.ActivationFunctionType.NONE:
                         fused_op_name = f"FUSED_{activation_dict[fused_activation_enum]}"
                         ops_found.add(fused_op_name)
+
+                if hasattr(options, 'QuantizedBiasType'):
+                    if options.QuantizedBiasType() == tflite.TensorType.FLOAT32:
+                        print("QuantizedBiasType: TensorType.FLOAT32")
+                    else:
+                        print("QuantizedBiasType: Other")
+
+                if hasattr(options, 'PotScaleInt16'):
+                    if options.PotScaleInt16():
+                        print("PotScaleInt16: True")
+                    else:
+                        print("PotScaleInt16: False")
+
 
         if is_integer_only:
             continue
@@ -162,10 +227,10 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
                 else:
                     mixed_networks.append(model_path)
                 mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
-                mod = tvm.relax.transform.NormalizeQDQPatterns()(mod)
+                # mod = tvm.relax.transform.NormalizeQDQPatterns()(mod)
                 mod = tvm.relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-                mod = tvm.relax.transform.LowerQNNOps()(mod)
-                mod.show()
+                mod = tvm.relax.transform.LowerQNNOps("litert")(mod)
+                # mod.show()
             except tvm.error.OpNotImplemented as ex:
                 errors.append(model_path)
                 print(ex)
