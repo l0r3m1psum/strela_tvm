@@ -27,7 +27,7 @@ pushd 3rdparty
         if not exist llvm\build (md llvm\build || goto :exit)
         pushd llvm\build || goto :exit
             cmake ^
-                -DLLVM_ENABLE_PROJECTS=clang ^
+                -DLLVM_ENABLE_PROJECTS=clang;mlir ^
                 "-DLLVM_TARGETS_TO_BUILD=X86;ARM;AArch64" ^
                 -DLLVM_INCLUDE_TESTS=OFF ^
                 -DCMAKE_BUILD_TYPE=%build_type% .. || goto :exit
