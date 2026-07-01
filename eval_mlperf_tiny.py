@@ -180,8 +180,52 @@ def get_io_quantization_params(
 def quantize(x, s, zp):
     return numpy.clip(numpy.round(x/s) + zp, -128, 127).astype(numpy.int8)
 
+def dequantize(quant, scales, zero_points, axis: int=1):
+    quant = numpy.asarray(quant, dtype=numpy.int32)
+    scales = numpy.asarray(scales, dtype=numpy.float32)
+    zero_points = numpy.asarray(zero_points, dtype=numpy.int32)
+
+    any_vector = scales.shape or zero_points.shape
+    if any_vector:
+        try:
+            quant.shape[axis]
+        except IndexError as ex:
+            raise ValueError("invalid axis") from ex
+
+    qparams = [scales, zero_points]
+    for i, qparam in enumerate(qparams):
+        if qparam.shape:
+            if qparam.ndim != 1: raise ValueError("quantization parameters must be a scalars or 1D vectors")
+            if qparam.shape[0] != quant.shape[axis]: raise ValueError("dimension mismatch")
+            broadcast_shape = [1] * quant.ndim
+            broadcast_shape[axis] = -1
+            qparams[i] = numpy.reshape(qparam, broadcast_shape)
+    scales, zero_points = qparams
+
+    return (quant - zero_points) * scales
+
 def dequantize(q, s, zp):
     return (q.astype(numpy.float32) - zp)*s
+
+def get_litert_intermediates_in_order(interpreter):
+    tensor_details = {detail['index']: detail for detail in interpreter.get_tensor_details()}
+
+    res = []
+    seen_indices = set()
+
+    # _get_ops_details returns the execution plan in strict topological order
+    for op in interpreter._get_ops_details():
+        op_name = op.get('op_name', 'UNKNOWN_OP')
+
+        for tensor_index in op.get('outputs', []):
+            if tensor_index not in seen_indices and tensor_index in tensor_details:
+                tensor_name = tensor_details[tensor_index]['name']
+
+                tensor_data = interpreter.get_tensor(tensor_index)
+                res.append((op_name, tensor_index, tensor_name, tensor_data))
+                seen_indices.add(tensor_index)
+
+    return res
 
 def run_tflite_inference(model_path, input_batches, task):
     """
@@ -189,19 +233,30 @@ def run_tflite_inference(model_path, input_batches, task):
     For Anomaly Detection: input_batches is a list where each element is
                            all sliding windows for a SINGLE audio file.
     """
-    interpreter = Interpreter(model_path=str(model_path))
-    interpreter.allocate_tensors()
-
     with open(model_path, "rb") as f:
         tflite_model_buf = f.read()
+
+    import tensorflow as tf
+    tf.lite.experimental.Analyzer.analyze(model_content=tflite_model_buf)
+    # interpreter = tf.lite.Interpreter(model_content=tflite_model_buf, experimental_preserve_all_tensors=True)
+    interpreter = Interpreter(model_content=tflite_model_buf, experimental_preserve_all_tensors=True)
+    interpreter.allocate_tensors()
+
     tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
     mod = relax.frontend.tflite.from_tflite(tflite_model)
     # mod = relax.transform.NormalizeQDQPatterns()(mod)
     inputs_qparams, outputs_qparams = get_io_quantization_params(mod["main"])
     input_qparams = next(iter(inputs_qparams.values()))
     output_qparams = outputs_qparams[0]
-    # mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-    # mod = relax.transform.LowerQNNOps()(mod)
+    mod = relax.transform.PrintPatternsOutput(
+        (relax.transform.qnn_transforms.make_qdq_bilinear_layer_pattern().pattern,)
+    )(mod)
+    mod.show()
+    mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
+    mod.show()
+    # sembra che RewriteQDQPatternsToQNNOps introduca un pazzo bug che fa riutilizzare un peso...
+    mod = relax.transform.LowerQNNOps("litert")(mod)
+    mod.show()
     ex = tvm.compile(mod, tvm.target.Target("llvm"))
     vm = relax.VirtualMachine(ex, tvm.cpu())
 
@@ -269,14 +324,45 @@ def run_tflite_inference(model_path, input_batches, task):
         interpreter.invoke()
         output_data_tf = interpreter.get_tensor(output_details['index']).copy()
 
+        litert_intermediates_ord = get_litert_intermediates_in_order(interpreter)
+
+        captured_index = 0
+        captured_quantize_outputs = {}
+
+        def capture_quantize_outputs(func, func_symbol, before_run, ret_value, *args):
+            nonlocal captured_index
+            symbol_str = str(func_symbol)
+            if before_run and symbol_str == "relax.run.print":
+                tensor_data = args[-1].numpy()
+                empty = numpy.empty((0, *tensor_data.shape[1:]), dtype=tensor_data.dtype)
+                symbol_str_num = symbol_str + str(captured_index)
+                prev_tensor_data = captured_quantize_outputs.get(symbol_str_num, empty)
+                batch_axis = 0
+                captured_quantize_outputs[symbol_str_num] = numpy.concatenate(
+                    (prev_tensor_data, tensor_data),
+                    axis=batch_axis
+                )
+
+                captured_index = captured_index + 1
+                return relax.VMInstrumentReturnKind.SKIP_RUN
+            return relax.VMInstrumentReturnKind.NO_OP
+
+        vm.set_instrument(capture_quantize_outputs)
+
         output_data_tvm = []
         for datum in batch_ready:
             datum = datum[numpy.newaxis, :]
             datum = tvm.runtime.tensor(datum, tvm.cpu())
             out = vm["main"](datum)
+            captured_index = 0 # This really is a terrible hack to capture all the batches...
             output_data_tvm.append(out.numpy())
         output_data_tvm = numpy.concatenate(output_data_tvm, axis=0)
 
+        assert output_data_tf.shape == output_data_tvm.shape
+
+        # numpy.sum(numpy.abs(captured_quantize_outputs['relax.run.print0'].astype("int32") - litert_intermediates_ord[0][3].astype("int32")))
+        # numpy.sum(numpy.abs(captured_quantize_outputs['relax.run.print1'].astype("int32") - litert_intermediates_ord[1][3].astype("int32")))
+        # numpy.sum(numpy.abs(captured_quantize_outputs['relax.run.print2'].astype("int32") - litert_intermediates_ord[2][3].astype("int32")))
 
         for output_data, results in ((output_data_tf, results_tf,), (output_data_tvm, results_tvm,),):
             if output_data.dtype == numpy.int8:
@@ -459,14 +545,14 @@ if __name__ == "__main__":
     
     ad_models = (
         TINY_DIR / "anomaly_detection/trained_models/ad01_int8.tflite",
-        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint.tflite",
-        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro.tflite",
-        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro_intio.tflite",
+        #TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint.tflite",
+        #TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro.tflite",
+        #TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro_intio.tflite",
         # TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant.tflite",
     )
     
     # Execute (capped at 500 samples by default so you aren't waiting 5 minutes per run)
-    evaluate_cifar10(IC_DIR, ic_models)
+    # evaluate_cifar10(IC_DIR, ic_models)
     # TODO: support depthwise convolution in the tflite importer.
     # evaluate_vww(VWW_DIR, vww_models)
     evaluate_anomaly_detection(AD_DIR, ad_models)
