@@ -2,8 +2,10 @@ import numpy
 
 import tvm
 from tvm import rpc, te, ir, relax
-from tvm.contrib import utils
+from tvm.support import utils
 from tvm.script import ir as I, relax as R
+
+import pathlib
 
 target_cpu = tvm.target.Target({
     "kind": "llvm",
@@ -19,7 +21,7 @@ target_ext_dev = tvm.target.Target(
     host=target_cpu
 )
 
-host = "10.100.4.202"
+host = "10.100.4.137"
 port = 9090
 
 remote = rpc.connect(host, port)
@@ -145,3 +147,29 @@ def try_compile_with_zero_copy():
     print(z)
     z = vm["main"](xn, w)
     print(z)
+
+@lambda _: _()
+def try_to_compile_centered_bilinear_prod():
+    import tflite
+    import tvm.relax.frontend.tflite
+
+    train_dir = pathlib.Path("3rdparty/tiny/benchmark/training")
+    ad_model = train_dir / "anomaly_detection/trained_models/ad01_int8.tflite"
+
+    model_path = ad_model
+    with open(model_path, "rb") as f:
+        tflite_model_buf = f.read()
+
+    tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
+    mod = relax.frontend.tflite.from_tflite(tflite_model)
+    mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
+    mod.show()
+    mod = relax.transform.LowerQNNOps("litert")(mod)
+    mod.show()
+    mod = relax.transform.FuseOpsByPattern(
+        patterns, bind_constants=False, annotate_codegen=True
+    )(mod)
+    mod = relax.transform.MergeCompositeFunctions()(mod)
+    mod.show()
+    mod = relax.transform.RunCodegen()(mod)
+    mod.show()
