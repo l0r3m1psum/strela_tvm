@@ -237,7 +237,7 @@ def run_tflite_inference(model_path, input_batches, task):
         tflite_model_buf = f.read()
 
     import tensorflow as tf
-    tf.lite.experimental.Analyzer.analyze(model_content=tflite_model_buf)
+    # tf.lite.experimental.Analyzer.analyze(model_content=tflite_model_buf)
     # interpreter = tf.lite.Interpreter(model_content=tflite_model_buf, experimental_preserve_all_tensors=True)
     interpreter = Interpreter(model_content=tflite_model_buf, experimental_preserve_all_tensors=True)
     interpreter.allocate_tensors()
@@ -249,14 +249,12 @@ def run_tflite_inference(model_path, input_batches, task):
     input_qparams = next(iter(inputs_qparams.values()))
     output_qparams = outputs_qparams[0]
     mod = relax.transform.PrintPatternsOutput(
-        (relax.transform.qnn_transforms.make_qdq_bilinear_layer_pattern().pattern,)
+        (relax.transform.qnn_transforms.make_qdq_2_bilinear_layer_pattern().pattern,)
     )(mod)
-    mod.show()
-    mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-    mod.show()
-    # sembra che RewriteQDQPatternsToQNNOps introduca un pazzo bug che fa riutilizzare un peso...
-    mod = relax.transform.LowerQNNOps("litert")(mod)
-    mod.show()
+    # mod.show()
+    # sembra che RewriteQDQPatternsTo introduca un pazzo bug che fa riutilizzare un peso...
+    mod = relax.transform.RewriteQDQPatternsTo("litert")(mod)
+    # mod.show()
     ex = tvm.compile(mod, tvm.target.Target("llvm"))
     vm = relax.VirtualMachine(ex, tvm.cpu())
 
@@ -545,14 +543,14 @@ if __name__ == "__main__":
     
     ad_models = (
         TINY_DIR / "anomaly_detection/trained_models/ad01_int8.tflite",
-        #TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint.tflite",
-        #TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro.tflite",
-        #TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro_intio.tflite",
+        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint.tflite",
+        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro.tflite",
+        TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant_fullint_micro_intio.tflite",
         # TINY_DIR / "anomaly_detection/trained_models/ToyCar/baseline_tf23/model/model_ToyCar_quant.tflite",
     )
     
     # Execute (capped at 500 samples by default so you aren't waiting 5 minutes per run)
-    # evaluate_cifar10(IC_DIR, ic_models)
+    evaluate_cifar10(IC_DIR, ic_models)
     # TODO: support depthwise convolution in the tflite importer.
     # evaluate_vww(VWW_DIR, vww_models)
     evaluate_anomaly_detection(AD_DIR, ad_models)

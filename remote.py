@@ -162,9 +162,7 @@ def try_to_compile_centered_bilinear_prod():
 
     tflite_model = tflite.Model.GetRootAsModel(tflite_model_buf, 0)
     mod = relax.frontend.tflite.from_tflite(tflite_model)
-    mod = relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-    mod.show()
-    mod = relax.transform.LowerQNNOps("litert")(mod)
+    mod = relax.transform.RewriteQDQPatternsTo("litert")(mod)
     mod.show()
     mod = relax.transform.FuseOpsByPattern(
         patterns, bind_constants=False, annotate_codegen=True

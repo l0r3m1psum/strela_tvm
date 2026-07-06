@@ -23,26 +23,27 @@ class MatmulReLU:
             R.output(z)
         return z
 
-mod = MatmulReLU
-mod.show()
-mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
-mod.show()
-mod = relax.transform.MergeCompositeFunctions()(mod)
-print("After partitioning:")
-mod.show()
-mod = relax.transform.RunCodegen()(mod)
-print("After codegen:")
-mod.show()
+if False:
+    mod = MatmulReLU
+    mod.show()
+    mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
+    mod.show()
+    mod = relax.transform.MergeCompositeFunctions()(mod)
+    print("After partitioning:")
+    mod.show()
+    mod = relax.transform.RunCodegen()(mod)
+    print("After codegen:")
+    mod.show()
 
-numpy.random.seed(0)
-x_np = numpy.random.randn(2, 4).astype("float32")
-w_np = numpy.random.randn(4, 8).astype("float32")
+    numpy.random.seed(0)
+    x_np = numpy.random.randn(2, 4).astype("float32")
+    w_np = numpy.random.randn(4, 8).astype("float32")
 
-with tvm.transform.PassContext(opt_level=3):
-    build = relax.build(mod, target)
+    with tvm.transform.PassContext(opt_level=3):
+        build = relax.build(mod, target)
 
-vm = relax.VirtualMachine(build, tvm.cpu())
-result = vm["main"](tvm.runtime.tensor(x_np, tvm.cpu()), tvm.runtime.tensor(w_np, tvm.cpu()))
+    vm = relax.VirtualMachine(build, tvm.cpu())
+    result = vm["main"](tvm.runtime.tensor(x_np, tvm.cpu()), tvm.runtime.tensor(w_np, tvm.cpu()))
 
 ################################################################################
 
@@ -67,11 +68,41 @@ with tvm.transform.PassContext(opt_level=3):
 
 vm = relax.VirtualMachine(build, tvm.cpu())
 
-print("relax.VirtualMachine created")
-
 numpy.random.seed(0)
 x_np = numpy.random.randn(2, 4).astype("float32")
 w_np = numpy.random.randn(4, 8).astype("float32")
 
-result = vm["main"](tvm.runtime.tensor(x_np, tvm.cpu()), tvm.runtime.tensor(w_np, tvm.cpu()))
-print(result)
+# result = vm["main"](tvm.runtime.tensor(x_np, tvm.cpu()), tvm.runtime.tensor(w_np, tvm.cpu()))
+# print(result)
+
+################################################################################
+
+@I.ir_module
+class CenteredBilinearProduct:
+    @R.function
+    def main(
+        x: R.Tensor((2, 4), "int8"),
+        w: R.Tensor((4, 8), "int8"),
+        b: R.Tensor((8,), "int32"),
+    ):
+        with R.dataflow():
+            y = R.matmul(
+                x.astype("int32") - R.const(12, "int8").astype("int32"),
+                w.astype("int32") - R.const(34, "int8").astype("int32"),
+            ) + b
+            R.output(y)
+        return y
+
+mod = CenteredBilinearProduct
+mod = relax.transform.Normalize()(mod)
+mod = relax.transform.CanonicalizeBindings()(mod)
+mod.show()
+raise SystemExit(0)
+mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
+mod.show()
+mod = relax.transform.MergeCompositeFunctions()(mod)
+print("After partitioning:")
+mod.show()
+mod = relax.transform.RunCodegen()(mod)
+print("After codegen:")
+mod.show()
