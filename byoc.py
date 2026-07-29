@@ -260,8 +260,6 @@ class Overlap:
         return y2
 
 mod = Overlap
-mod = relax.transform.Normalize()(mod)
-mod = relax.transform.CanonicalizeBindings()(mod)
 mod.show()
 mod = relax.transform.FuseOpsByPattern(patterns, bind_constants=False, annotate_codegen=True)(mod)
 mod.show()

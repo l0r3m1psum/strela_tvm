@@ -42,7 +42,6 @@ import pprint
 from typing import Tuple, Set
 
 import tflite
-import tvm.relax.frontend.tflite
 
 def is_tensor_constant(model: tflite.Model, tensor: tflite.Tensor) -> bool:
     buffer_index = tensor.Buffer()
@@ -219,21 +218,12 @@ for root, dirs, files in os.walk("3rdparty/tiny"):
                 % (float_tensor_count, quant_tensors_count, mixed_ops_count, per_axis_quant))
             print(ops)
             all_ops.update(ops)
-            try:
-                if quant_tensors_count == 0:
-                    float_networks.append(model_path)
-                elif mixed_ops_count == 0:
-                    int_quant_networks.append(model_path)
-                else:
-                    mixed_networks.append(model_path)
-                mod = tvm.relax.frontend.tflite.from_tflite(tflite_model)
-                # mod = tvm.relax.transform.NormalizeQDQPatterns()(mod)
-                mod = tvm.relax.transform.RewriteQDQPatternsToQNNOps()(mod)
-                mod = tvm.relax.transform.LowerQNNOps("litert")(mod)
-                # mod.show()
-            except tvm.error.OpNotImplemented as ex:
-                errors.append(model_path)
-                print(ex)
+            if quant_tensors_count == 0:
+                float_networks.append(model_path)
+            elif mixed_ops_count == 0:
+                int_quant_networks.append(model_path)
+            else:
+                mixed_networks.append(model_path)
 
 print("all operations\n\t" + str(all_ops))
 print("float_networks")
